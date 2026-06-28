@@ -2,6 +2,11 @@
 
 const TILE_SIZE: u32 = 32u;
 const OD_SCALE: f32 = 4096.0;
+// Revealage feedback is R8Unorm; storing raw transmittance there wastes precision
+// on the near-opaque end and saturates to 0 past ~5.5 nats of optical depth (1/256).
+// Instead we accumulate normalized optical depth (additive, linear-precision-matched
+// to an exponential quantity) and reconstruct transmittance via exp(-od) on read.
+const OD_MAX: f32 = 8.0;
 
 struct HistoParams {
     tile_count_x: u32,
@@ -57,12 +62,13 @@ fn fs_main(in: VertexOutput) -> WboitOutput {
     let w = normalized_z;
     let equalized_z = textureSampleLevel(cdf_texture, cdf_sampler, vec3f(u, v, w), 0.0).r;
 
-    // Transmittance weight from previous frame's per-pixel revealage
-    let prev_R = textureLoad(prev_revealage_tex, vec2<i32>(in.clip_position.xy), 0).r;
-    let wt = pow(max(prev_R, 1e-4), equalized_z);
+    // Transmittance weight from previous frame's per-pixel optical depth
+    let prev_od_norm = textureLoad(prev_revealage_tex, vec2<i32>(in.clip_position.xy), 0).r;
+    let prev_T = exp(-prev_od_norm * OD_MAX);
+    let wt = pow(max(prev_T, 1e-4), equalized_z);
 
     var out: WboitOutput;
     out.accum = vec4<f32>(lit.rgb * alpha * wt, alpha * wt);
-    out.revealage = alpha;
+    out.revealage = clamp(optical_depth / OD_MAX, 0.0, 1.0);
     return out;
 }

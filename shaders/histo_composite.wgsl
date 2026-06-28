@@ -1,3 +1,5 @@
+const OD_MAX: f32 = 8.0;
+
 @group(0) @binding(0) var accum_tex: texture_2d<f32>;
 @group(0) @binding(1) var revealage_tex: texture_2d<f32>;
 
@@ -27,7 +29,8 @@ fn fs_main(in: CompositeOutput) -> @location(0) vec4<f32> {
 
     var alpha: f32;
     if (use_revealage != 0u) {
-        let revealage = textureLoad(revealage_tex, coords, 0).r;
+        let od_norm = textureLoad(revealage_tex, coords, 0).r;
+        let revealage = exp(-od_norm * OD_MAX);
         alpha = 1.0 - revealage;
     } else {
         alpha = 1.0 - exp(-accum.a);
