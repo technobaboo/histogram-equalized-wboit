@@ -70,6 +70,14 @@ pub struct Renderer {
     pub surface_config: wgpu::SurfaceConfiguration,
     pub mode: RenderMode,
     pub use_revealage: bool,
+    /// When true the swapchain is cleared to an opaque background instead of transparent.
+    ///
+    /// This is not just cosmetic. The surface is `Bgra8UnormSrgb` + `PreMultiplied`, so the
+    /// GPU sRGB-encodes *after* premultiplying and the buffer ends up holding
+    /// `srgb(color * alpha)`, whereas compositors expect `srgb(color) * alpha`. The two
+    /// agree only at alpha 0 and 1 -- so forcing the whole frame to alpha 1 sidesteps the
+    /// mismatch entirely and shows true colours.
+    pub opaque_background: bool,
 
     // Shared resources
     camera_buffer: wgpu::Buffer,
@@ -180,6 +188,15 @@ impl Renderer {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
+        // Worth logging: the surface format decides whether the GPU sRGB-encodes on write,
+        // and the alpha mode decides what the compositor thinks the alpha means. Both
+        // change how the window blends against the desktop.
+        println!(
+            "Surface: {:?} (srgb: {}), alpha mode: {:?}",
+            surface_config.format,
+            surface_config.format.is_srgb(),
+            surface_config.alpha_mode,
+        );
         surface.configure(&device, &surface_config);
 
         // Bind group layouts
@@ -411,6 +428,7 @@ impl Renderer {
             surface_config,
             mode: RenderMode::AlphaBlend,
             use_revealage: true,
+            opaque_background: true,
             camera_buffer,
             camera_bind_group,
             depth_texture_view,
@@ -554,6 +572,21 @@ impl Renderer {
         let sp = self.splats.as_mut()?;
         sp.splat_scale = (sp.splat_scale * factor).clamp(0.05, 8.0);
         Some(sp.splat_scale)
+    }
+
+    /// Clear colour for the swapchain. The documented demo background is dark grey; the
+    /// transparent variant lets the desktop show through instead.
+    fn clear_color(&self) -> wgpu::Color {
+        if self.opaque_background {
+            wgpu::Color {
+                r: 0.1,
+                g: 0.1,
+                b: 0.1,
+                a: 1.0,
+            }
+        } else {
+            wgpu::Color::TRANSPARENT
+        }
     }
 
     /// Issue the draws for whichever scene is loaded.
@@ -947,12 +980,7 @@ impl Renderer {
                 view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 0.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(self.clear_color()),
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
@@ -1026,12 +1054,7 @@ impl Renderer {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(self.clear_color()),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1117,12 +1140,7 @@ impl Renderer {
                     view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(self.clear_color()),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,

@@ -54,9 +54,9 @@ impl ApplicationHandler for App {
         }
 
         let title = if self.splats.is_some() {
-            "3DGS WBOIT Demo - 1/2/3 modes, A exact-alpha, T tile, B bins, C cap, [ ] size, R reset"
+            "3DGS WBOIT Demo - 1/2/3 modes, A exact-alpha, W window, T tile, B bins, C cap, R reset"
         } else {
-            "WBOIT Demo - 1/2/3 modes, A exact-alpha, T tile, B bins, M meshes"
+            "WBOIT Demo - 1/2/3 modes, A exact-alpha, W window, T tile, B bins, M meshes"
         };
         let attrs = Window::default_attributes()
             .with_title(title)
@@ -137,6 +137,18 @@ impl ApplicationHandler for App {
                                 println!(
                                     "Meshes: {}",
                                     if self.scene.show_meshes { "ON" } else { "OFF" }
+                                );
+                            }
+                            "w" | "W" => {
+                                renderer.opaque_background = !renderer.opaque_background;
+                                println!(
+                                    "Background: {}",
+                                    if renderer.opaque_background {
+                                        "opaque dark grey (true colours; sidesteps the \
+premultiplied-sRGB mismatch with the compositor)"
+                                    } else {
+                                        "transparent (composited by the window manager)"
+                                    }
                                 );
                             }
                             "b" | "B" => {
