@@ -18,11 +18,12 @@ fn fs_main(in: VertexOutput) -> WboitOutput {
     // Linearize depth: clip_position.w = 1/w_clip, and w_clip = eye-space distance
     let linear_z = 1.0 / in.clip_position.w;
 
-    // Normalize to [0, 1] using camera near/far planes
-    let d = clamp((linear_z - camera.near) / (camera.far - camera.near), 0.0, 1.0);
+    // Normalize over the depth window the geometry actually occupies, NOT near/far --
+    // see the depth binning note in CLAUDE.md for why that distinction matters.
+    let d = clamp((linear_z - camera.depth_min) / camera.depth_range, 0.0, 1.0);
 
     // Exponential weight spanning the usable f16 accumulation range (~7.8 orders of magnitude)
-    // d=0 (near) → 2^13 = 8192, d=1 (far) → 2^-13 ≈ 1.2e-4
+    // d=0 (window near edge) → 2^13 = 8192, d=1 (far edge) → 2^-13 ≈ 1.2e-4
     // Steeper than McGuire: steps evenly through f16 exponent bits for max layer discrimination
     let w = alpha * clamp(exp2(13.0 - 26.0 * d), 1e-4, 8192.0);
 

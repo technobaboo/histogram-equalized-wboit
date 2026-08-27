@@ -34,7 +34,7 @@ fn fs_main(in: VertexOutput) -> WboitOutput {
     // Linearize depth
     let linear_z = 1.0 / in.clip_position.w;
     let normalized_z = clamp(
-        (linear_z - camera.near) / (camera.far - camera.near),
+        (linear_z - camera.depth_min) / camera.depth_range,
         0.0,
         1.0,
     );
@@ -54,7 +54,12 @@ fn fs_main(in: VertexOutput) -> WboitOutput {
     // Sample CDF from 3D texture — hardware trilinear gives free spatial + depth interpolation
     let u = in.clip_position.x / f32(histo_params.tile_count_x * TILE_SIZE);
     let v = in.clip_position.y / f32(histo_params.tile_count_y * TILE_SIZE);
-    let w = normalized_z;
+    // Texel k holds the exclusive prefix, i.e. tau at the bin's near edge z = k/N, but a
+    // 3D texture samples texel k at (k+0.5)/N. Shifting by half a texel lines the two up,
+    // so linear filtering interpolates between true bin edges: a fragment f of the way
+    // through bin k picks up f of that bin's own optical depth, which is what
+    // transmittance in front of it actually means.
+    let w = normalized_z + 0.5 / f32(nb);
     let equalized_z = textureSampleLevel(cdf_texture, cdf_sampler, vec3f(u, v, w), 0.0).r;
 
     // Transmittance weight from previous frame's per-pixel revealage

@@ -59,10 +59,14 @@ fn main(
         let total_od = buf_a[nb - 1u];
         var cdf_val: f32;
         if (total_od > 0.0) {
-            cdf_val = buf_a[bin] / total_od;
+            // Exclusive prefix: optical depth strictly in FRONT of this bin. Subtracting
+            // this bin's own contribution is what keeps a fragment from being occluded by
+            // itself and by everything else that happens to share its bin -- which is
+            // negligible for a handful of quads but dominant for a splat cloud.
+            cdf_val = (buf_a[bin] - val) / total_od;
         } else {
             // Linear fallback when no fragments hit this tile
-            cdf_val = f32(bin + 1u) / f32(nb);
+            cdf_val = f32(bin) / f32(nb);
         }
 
         textureStore(cdf_out, vec3i(i32(tile_x), i32(tile_y), i32(bin)), vec4f(cdf_val, 0.0, 0.0, 0.0));

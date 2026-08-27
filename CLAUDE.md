@@ -152,7 +152,9 @@ Single pass:
   - Blend: `Zero + OneMinusSrc` (multiplicative)
 - Depth: depth texture (write disabled, depth test only)
 - Fragment outputs: `(premul_color * w, alpha * w)` to color0, `alpha` to color1
-- Weight function: `w = alpha * max(1e-2, min(3e3, 10.0 / (1e-5 + pow(z/5, 2) + pow(z/200, 4))))`
+- Weight function: `w = alpha * clamp(exp2(13.0 - 26.0 * d), 1e-4, 8192.0)`, where `d` is
+  depth normalized over the geometry's depth window (see *Depth binning window*). This steps
+  evenly through the f16 exponent range rather than using McGuire & Bavoil's original curve.
 
 **Pass 2 - Composite (fullscreen triangle):**
 - Color target: swapchain (clear to background)
@@ -209,6 +211,34 @@ Single pass:
 
 ## Key Technical Notes
 
+- **Depth binning window (`camera.depth_min` / `camera.depth_range`)**: Both WBOIT modes
+  normalize eye-space depth to `[0,1]` before using it, mode 2 for its weight curve and
+  mode 3 for its histogram bins. That normalization uses the span the geometry actually
+  occupies -- `[distance - scene_radius, distance + scene_radius]` -- **not** `near`/`far`.
+  Using near/far is a trap: a camera fitted to a splat scene sets `near = 0.01r` and
+  `far = 50r`, so the geometry (which sits at ~1.8r..3.2r) lands in 4% of the range. Every
+  fragment then collapses into ~1.7 of the 64 histogram bins, mode 2's weight ratio falls
+  from ~1e7x to 1.5x, and both modes degenerate into a flat average along the ray -- the
+  washed-out look. With the fitted window the same scene spans ~38 bins. `Camera::uniform()`
+  derives the window each frame; `scene_radius` defaults to 6.0 for the built-in quad scene
+  and is set by `fit_to()` for loaded splats.
+- **CDF is an EXCLUSIVE prefix sum, sampled with a half-texel shift**: `cdf[k]` holds the
+  optical depth strictly in *front* of bin k, i.e. tau at the bin's near edge `z = k/N`. Two
+  reasons. First, transmittance in front of a fragment must not include the fragment's own
+  optical depth, nor that of anything else sharing its bin -- negligible for six quads, but
+  dominant for a splat cloud with hundreds of fragments per bin. Second, with the exclusive
+  form, linear filtering between texels interpolates between true bin *edges*, so a fragment
+  a fraction `f` through bin k correctly picks up `f` of that bin's own optical depth.
+  Because a 3D texture samples texel k at `(k+0.5)/N`, the accum shaders sample at
+  `normalized_z + 0.5/num_bins` to line texel centres up with bin edges. Sampling an
+  inclusive CDF at `normalized_z` (the earlier form) reads `tau(z + 0.5/N)` -- half a bin of
+  over-occlusion on top of the self-occlusion.
+- **Why the transmittance weight is exact**: `tau_total = -ln(R_prev)` and
+  `CDF(z) = tau(z)/tau_total`, so `pow(R_prev, CDF(z)) = exp(-tau(z)) = T(z)`, the exact
+  transmittance in front of the fragment. Since `sum(a_i * T_i)` telescopes to
+  `1 - prod(1 - a_i)`, the composite `avg_color * (1 - revealage)` reduces algebraically to
+  the exact front-to-back integral. Mode 3's error is therefore entirely in how well the
+  binned, tiled, one-frame-late CDF approximates the true `tau(z)`.
 - **Atomics in fragment shaders**: `atomicAdd` on `var<storage, read_write>` IS allowed in fragment shaders per WGSL spec. The underlying Vulkan feature `fragmentStoresAndAtomics` is widely supported on desktop.
 - **CDF build via compute shader**: A single workgroup of 256 threads performs a parallel Hillis-Steele inclusive prefix sum, normalizes, writes CDF, and clears the histogram. Dispatched as `(1,1,1)` between the accum and composite render passes.
 - **First frame**: CDF buffer initialized to linear fallback values `(1/256, 2/256, ..., 256/256)` with total optical depth = `257/256` on creation (`src/renderer.rs` `new()`). Histogram starts zeroed.

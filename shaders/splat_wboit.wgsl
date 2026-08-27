@@ -24,9 +24,11 @@ fn fs_main(in: SplatVsOut) -> WboitOutput {
 
     // clip_position.w is 1/w_clip in the fragment stage, and w_clip is the eye-space depth.
     let linear_z = 1.0 / in.clip_position.w;
-    let d = clamp((linear_z - camera.near) / (camera.far - camera.near), 0.0, 1.0);
+    // Same depth window as the mesh path, so the two are directly comparable.
+    let d = clamp((linear_z - camera.depth_min) / camera.depth_range, 0.0, 1.0);
 
-    // d=0 (near) -> 2^13, d=1 (far) -> 2^-13: steps evenly through the f16 exponent range.
+    // d=0 (window near edge) -> 2^13, d=1 (far edge) -> 2^-13: steps evenly through the
+    // f16 exponent range.
     let w = alpha * clamp(exp2(13.0 - 26.0 * d), 1e-4, 8192.0);
 
     var out: WboitOutput;

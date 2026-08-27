@@ -41,7 +41,7 @@ fn fs_main(in: SplatVsOut) -> WboitOutput {
 
     let linear_z = 1.0 / in.clip_position.w;
     let normalized_z = clamp(
-        (linear_z - camera.near) / (camera.far - camera.near),
+        (linear_z - camera.depth_min) / camera.depth_range,
         0.0,
         1.0,
     );
@@ -60,7 +60,10 @@ fn fs_main(in: SplatVsOut) -> WboitOutput {
     // Trilinear sampling of the CDF volume gives spatial and depth interpolation for free.
     let u = in.clip_position.x / f32(histo_params.tile_count_x * TILE_SIZE);
     let v = in.clip_position.y / f32(histo_params.tile_count_y * TILE_SIZE);
-    let equalized_z = textureSampleLevel(cdf_texture, cdf_sampler, vec3f(u, v, normalized_z), 0.0).r;
+    // Half-texel shift: texel k holds the exclusive prefix at bin edge z = k/N. See
+    // histo_accum.wgsl for the full reasoning.
+    let w = normalized_z + 0.5 / f32(nb);
+    let equalized_z = textureSampleLevel(cdf_texture, cdf_sampler, vec3f(u, v, w), 0.0).r;
 
     let prev_r = textureLoad(prev_revealage_tex, vec2<i32>(in.clip_position.xy), 0).r;
     let wt = pow(max(prev_r, 1e-4), equalized_z);

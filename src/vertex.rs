@@ -47,7 +47,12 @@ pub struct CameraUniform {
     /// Focal length in pixels, used to project the covariance to screen space.
     pub focal: [f32; 2],
     pub viewport: [f32; 2],
-    pub _padding0: [f32; 2],
+    /// Depth-binning range for the WBOIT weight curves and the histogram. This is the
+    /// depth span the geometry actually occupies -- NOT near/far, which for a fitted
+    /// camera is orders of magnitude wider and collapses every fragment into a couple
+    /// of histogram bins.
+    pub depth_min: f32,
+    pub depth_range: f32,
     /// World-space eye position, for view-dependent SH evaluation.
     pub cam_pos: [f32; 3],
     pub _padding1: f32,

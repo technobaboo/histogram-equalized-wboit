@@ -13,6 +13,8 @@ pub struct Camera {
     pub viewport: (f32, f32),
     pub min_distance: f32,
     pub max_distance: f32,
+    /// Bounding radius of whatever is loaded; sets the WBOIT depth-binning range.
+    pub scene_radius: f32,
     /// Where `reset()` returns to.
     home: (f32, f32, f32, glam::Vec3),
     // drag state
@@ -34,6 +36,8 @@ impl Camera {
             viewport: (1280.0, 720.0),
             min_distance: 1.0,
             max_distance: 50.0,
+            // Spans the built-in quad scene, which sits within ~6 units of the origin.
+            scene_radius: 6.0,
             home: (0.5, 0.3, 8.0, glam::Vec3::ZERO),
             dragging: false,
             last_mouse: None,
@@ -50,6 +54,7 @@ impl Camera {
         self.far = radius * 50.0;
         self.min_distance = radius * 0.05;
         self.max_distance = radius * 20.0;
+        self.scene_radius = radius;
         self.pitch = 0.15;
         self.yaw = 0.0;
         self.home = (self.yaw, self.pitch, self.distance, self.target);
@@ -81,6 +86,8 @@ impl Camera {
         let (w, h) = self.viewport;
         // Pixels per unit at unit depth. Both axes share it: width / aspect == height.
         let fy = h / (2.0 * (self.fov_y * 0.5).tan());
+        let depth_min = (self.distance - self.scene_radius).max(self.near);
+        let depth_max = self.distance + self.scene_radius;
         CameraUniform {
             view_proj: vp.to_cols_array_2d(),
             view: view.to_cols_array_2d(),
@@ -88,7 +95,10 @@ impl Camera {
             far: self.far,
             focal: [fy, fy],
             viewport: [w, h],
-            _padding0: [0.0; 2],
+            // Bracket the geometry, so the weight curve and the depth histogram spend
+            // their full dynamic range on the depths that actually contain fragments.
+            depth_min,
+            depth_range: (depth_max - depth_min).max(1e-4),
             cam_pos: self.eye().to_array(),
             _padding1: 0.0,
         }
