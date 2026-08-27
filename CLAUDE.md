@@ -34,6 +34,10 @@ Both numbers depend on the view set and the camera distance, so compare within a
 across runs -- the tables further down are all from `--quality 8 --size 640x360` and are
 internally consistent with each other but not with this one.
 
+**All mode 3 numbers in this file predate the rasterized-binning rework** (16
+channel-packed bins, tent deposit, B-spline gather, no atomics -- see the mode 3 section)
+and need re-measuring; the mode 2 and mode 4 numbers are unaffected.
+
 ## Project Setup
 
 ```
@@ -87,16 +91,21 @@ wboit-demo/
 │       ├── mod.rs              # DONE - Re-exports
 │       ├── alpha_blend.rs      # DONE - Mode 1 pipeline (SrcAlpha/OneMinusSrcAlpha blend)
 │       ├── naive_wboit.rs      # DONE - Mode 2 accum pipeline (MRT) + composite pipeline
-│       ├── histogram_wboit.rs  # DONE - Mode 3 accum + compute CDF + composite pipelines
+│       ├── histogram_wboit.rs  # DONE - Mode 3 accum + binning + CDF-resolve pipelines (+ mode 4's compute CDF)
 │       ├── sliced_oit.rs       # DONE - Mode 4 front prepass + slab accum + ordered composite
-│       └── splat.rs            # DONE - 3DGS variants of all four accumulation pipelines
+│       └── splat.rs            # DONE - 3DGS variants of all four accumulation pipelines + binning
 └── shaders/
     ├── common.wgsl             # DONE - Camera/Object/VertexInput/VertexOutput structs, basic_vertex, simple_lighting
     ├── alpha_blend.wgsl        # DONE - vs_main/fs_main calling basic_vertex + simple_lighting
     ├── wboit_accum.wgsl        # DONE - McGuire&Bavoil weight function, MRT output (accum + revealage)
     ├── wboit_composite.wgsl    # DONE - Fullscreen triangle, textureLoad accum/revealage, alpha composite
-    ├── histo_accum.wgsl        # DONE - atomicAdd to global histogram, CDF lookup, transmittance weight
-    ├── histo_cdf_build.wgsl    # DONE - Compute shader: parallel prefix sum (Hillis-Steele), CDF normalize, histogram clear
+    ├── binning_common.wgsl     # DONE - Mode 3 binning pass: tile-grid clip remap, tent deposit into 16 channels
+    ├── histo_binning.wgsl      # DONE - Mesh binning pass (scene rasterized at 1 px/tile, additive blend)
+    ├── splat_binning.wgsl      # DONE - Splat binning pass (same EWA projection at 1 px/tile)
+    ├── histo_cdf_resolve.wgsl  # DONE - Fragment-shader CDF build: per-pixel 16-bin scan + normalize
+    ├── cdf_sample_common.wgsl  # DONE - Channel-packed CDF lookup: manual depth lerp, B-spline spatial gather
+    ├── histo_accum.wgsl        # DONE - CDF lookup + transmittance weight (no histogram writes anymore)
+    ├── histo_cdf_build.wgsl    # DONE - (mode 4 only) compute prefix sum over the atomic histogram buffer
     ├── histo_composite.wgsl    # DONE - WBOIT composite only (textures + revealage flag)
     ├── splat_common.wgsl       # DONE - EWA projection, conic evaluation, SH degree-3 eval
     ├── splat_alpha.wgsl        # DONE - Mode 1 fragment output for splats
@@ -188,36 +197,59 @@ Single pass:
 - Sample accum and optical-depth textures
 - Output: `color = accum.rgb / max(accum.a, 1e-5)`, `alpha = 1 - exp(-tau)`
 
-### Mode 3: Histogram-Equalized WBOIT (global, 3 passes)
-> Pipelines: `src/pipeline/histogram_wboit.rs` (`accum_pipeline` + `cdf_build_pipeline` (compute) + `composite_pipeline`)
-> Shaders: `shaders/histo_accum.wgsl` (prepended with common), `shaders/histo_cdf_build.wgsl` (compute), `shaders/histo_composite.wgsl` (standalone)
-> Render path: `src/renderer.rs` `render_histogram_wboit()`
-> Buffer setup: `src/renderer.rs` `new()` (histogram_buffer, cdf_buffer, histo_params_buffer) and `resize()`
+### Mode 3: Histogram-Equalized WBOIT (tiled, 4 passes, no atomics)
+> Pipelines: `src/pipeline/histogram_wboit.rs` (`accum_pipeline` + `binning_pipeline` +
+> `cdf_resolve_pipeline` + `composite_pipeline`), plus `SplatPipelines::binning_pipeline`
+> Shaders: `shaders/histo_accum.wgsl` (prepended with common + cdf_sample_common),
+> `shaders/{binning_common,histo_binning,splat_binning}.wgsl`,
+> `shaders/histo_cdf_resolve.wgsl`, `shaders/histo_composite.wgsl` (standalone)
+> Render path: `src/renderer.rs` `render_histogram_wboit()` + `draw_binning()`
+> Texture setup: `create_tile_histo_textures()` in `src/renderer.rs`, rebuilt on resize/`T`
 
-**Pass 1 - Accumulation + Optical Depth Histogram Recording:**
+Reworked after the layered-WBOIT reading (Friederichs et al., GI 2021): the histogram is
+now built by **rasterization + additive blending** instead of fragment-shader atomics, and
+every discretized axis has a smooth basis on the *write* side, not just the read side.
+Fixed at 16 depth bins, channel-packed into four `Rgba16Float` tile-resolution textures
+(4 MRTs x 32 bytes/sample = WebGPU's default limit, the mobile-safe budget). Every
+cross-pass read is same-pixel by construction ("subpass-shaped"), so a Vulkan backend can
+fuse binning+resolve and accum+composite into subpasses / `dynamic_rendering_local_read`
+with the histogram never leaving tile memory.
+
+**Pass 1 - Accumulation:**
 - Same MRT setup as Mode 2 (accum `Rgba16Float` + optical depth `R16Float`)
-- Additional bind groups: histogram buffer (`read_write`, atomic), CDF buffer (`read`), params uniform
-- Fragment shader does:
-  1. Compute linear depth `z` from clip-space (using `clip_position.w`)
-  2. Compute bin index: `bin = clamp(u32(normalized_z * f32(num_bins)), 0, num_bins - 1)`
-  3. Compute optical depth: `od = -ln(1 - alpha)`, quantize: `u32(od * OD_SCALE)` where `OD_SCALE = 4096`
-  4. `atomicAdd(&histogram[bin], quantized_od)` - accumulates optical depth per bin (not fragment count)
-  5. Read CDF from **previous frame** with piecewise-linear interpolation between `cdf[bin-1]` and `cdf[bin]`
-  6. Reconstruct absolute cumulative optical depth: `tau = interpolated_cdf * cdf[num_bins]`
-  7. Weight: `w = exp(-tau)` — exact transmittance before this layer (per-bin resolution)
-  8. Output to MRT: `(premul_color * w, alpha * w)` to accum, `tau` to optical depth
+- Group 2: params, the four CDF textures resolved on the *previous* frame, sampler, and
+  the previous frame's optical depth. Read-only -- no storage bindings, nothing that
+  disables early-Z / hidden-surface removal on tiled GPUs.
+- `sample_cdf()` (`cdf_sample_common.wgsl`): hardware bilinear across tiles, upgraded to a
+  cubic **B-spline gather** (4 bilinear taps, `SPATIAL_SMOOTH` const to compare) so the
+  weight field is C1 across the tile grid; depth is a manual lerp between the two CDF
+  edges straddling the fragment (edge `e` lives in channel `(e-1)&3` of texture `(e-1)>>2`,
+  edge 0 is implicit zero). Same exclusive-prefix self-occlusion semantics as before.
+- Weight `exp(-prev_tau * CDF(z))` with `prev_tau` from the optical-depth feedback texture,
+  exactly as before.
 
-**Pass 2 - CDF Build (compute shader):**
-- Dispatch: `(1, 1, 1)` workgroups, `@workgroup_size(256, 1, 1)`
-- Each thread handles one histogram bin
-- Parallel inclusive prefix sum via Hillis-Steele (8 steps for 256 bins) using workgroup shared memory
-- Normalize by total optical depth, write CDF. Store total OD in `cdf[num_bins]`. If total == 0, write linear fallback.
-- Clear histogram to 0 via `atomicStore` for next frame.
+**Pass 2 - Composite:** unchanged (fullscreen triangle, accum + optical depth + flag).
+Runs *before* the histogram passes: they only feed the next frame, so they sit at the tail
+of the frame off the critical path, where a tiler overlaps them with presentation.
 
-**Pass 3 - Composite (fullscreen triangle):**
-- Color target: swapchain (clear to background)
-- Bind groups: accum texture, optical-depth texture, flag uniform
-- Same composite math as Mode 2: read accum + optical depth, output blended color
+**Pass 3 - Binning:** the scene rasterized a second time at **one pixel per tile** into
+the four histogram targets, additive `One + One`, no depth attachment. `LoadOp::Clear` IS
+the histogram clear (free on tilers). Each fragment computes `od = -ln(1-alpha)` (clamped
+to 16) and `tent_deposit()` splits it linearly between the two bins its depth falls
+between -- the paper's smooth cross-layer weighting, exact rather than stochastic, because
+a second channel write is free where a second atomic was not. Scatter and gather now agree
+on the tent basis in depth, which is what removed the bin-boundary banding.
+`binning_clip()` remaps clip x/y so full-res pixel (x,y) lands on tile texel (x/ts, y/ts)
+even when the surface size is not a multiple of the tile size. The splat variant reuses
+`splat_vertex()` unchanged (the quad + conic are resolution-independent), giving a Monte
+Carlo estimate of each splat's optical depth over the tile.
+
+**Pass 4 - CDF resolve (fragment, not compute):** channel-packing made the per-tile prefix
+sum *per-pixel*: read this pixel's four histogram texels, scan 16 values in registers,
+normalize (linear ramp fallback for empty tiles), write this pixel's four CDF texels. No
+workgroup memory, no barriers, no Hillis-Steele. The CDF set is double-buffered: written
+on frame N, read by frame N+1's accumulation (one-frame lag as before; frame 0 reads zeros
+= uniform weights for one frame).
 
 ### Mode 4: Quantile-Sliced OIT (4 passes)
 > Pipelines: `src/pipeline/sliced_oit.rs` (`front_pipeline` + `accum_pipeline` + `composite_pipeline`),
@@ -231,8 +263,10 @@ Mode 3 uses the tile CDF as a **weight**, which is only as good as the assumptio
 tile's normalized depth profile matches the pixel's -- the tile-dilution failure documented
 below. Mode 4 uses the same CDF as an **ordering key**, which is a far weaker assumption:
 diluting the CDF rescales the quantile axis but leaves it *monotone*, so fragments keep
-their relative order and only slab boundaries drift. It reuses mode 3's histogram buffer,
-CDF volume, compute pass and bind group layout unchanged.
+their relative order and only slab boundaries drift. It still runs the ORIGINAL histogram
+machinery -- the atomic storage buffer, the 3D CDF volume, and the Hillis-Steele compute
+pass -- which mode 3 no longer touches after its rework; the rasterized-histogram
+treatment has not been ported to mode 4 yet.
 
 **Pass 0 - Front-surface prepass:**
 - Color target: `Rgba16Float`, `(color.rgb, normalized_z)`, cleared to `(0,0,0,1)`
@@ -249,7 +283,8 @@ CDF volume, compute pass and bind group layout unchanged.
 - `slice_scatter()` places the fragment at `quantile * 3` along the four slabs, split
   between the two it falls between, carrying `(color * tau, tau)`
 
-**Pass 2 - CDF build:** byte-for-byte the same compute dispatch as mode 3's pass 2.
+**Pass 2 - CDF build:** the compute dispatch (`histo_cdf_build.wgsl`) that used to also be
+mode 3's pass 2; now mode 4 is its only user.
 
 **Pass 3 - Ordered composite:** each slab resolves to `1 - exp(-tau)` with a
 tau-weighted average colour, then the four are alpha-composited front to back.
@@ -298,21 +333,22 @@ having moved off the spatial resolution of the CDF.
 median ms: mode 3 = 6.0, mode 4 without the prepass = 6.3 (+5%), mode 4 with it = 8.6
 (+43%). The extra geometry pass is the whole cost, and it buys 2.8x on loss.
 
-### Histogram Buffer Layout
-> Created in `src/renderer.rs` `new()` and recreated in `resize()`
+### Histogram / CDF Storage
 
-- Storage: `array<atomic<u32>>` of length `NUM_DEPTH_BINS` (256)
-- `NUM_DEPTH_BINS = 256` (const in `src/renderer.rs:8`)
-- Each bin accumulates **quantized optical depth** (`-ln(1-alpha) * OD_SCALE`), not fragment count
+**Mode 3** (`create_tile_histo_textures()` in `src/renderer.rs`, rebuilt on resize/`T`):
+- Histogram: four `Rgba16Float` textures at one texel per tile; channel `c` of texture `t`
+  is bin `t*4 + c` (16 bins fixed). Accumulated by additive blending in the binning pass,
+  cleared by `LoadOp::Clear`. Each bin holds **optical depth** (`-ln(1-alpha)`, f16,
+  clamped to 16 per fragment), not fragment count.
+- CDF: same four-texture layout, **double-buffered**; channel `c` of texture `t` holds the
+  normalized cumulative optical depth at bin edge `t*4 + c + 1` (edge 0 is implicit zero).
+  Written by the CDF-resolve fragment pass on frame N, read by frame N+1's accumulation.
+- f16 is enough: the CDF only ever consumes ratios, and the old path quantized through
+  `OD_SCALE = 4096` anyway.
 
-### CDF Buffer Layout
-> Created in `src/renderer.rs` `new()`, initialized with linear fallback, recreated in `resize()`
-
-- Storage: `array<f32>` of length `NUM_DEPTH_BINS + 1` (257)
-- Entries 0-255: normalized cumulative optical depth; entry 256: total absolute optical depth
-- `cdf[b]` = cumulative optical depth through bins 0..b, normalized to [0, 1]
-- `cdf[num_bins]` = total absolute optical depth
-- Written during compute pass (pass 2), read during accumulation pass (pass 1) of the *next* frame
+**Mode 4** (unchanged): `array<atomic<u32>>` histogram buffer of `tiles * num_bins`
+quantized-OD counters plus the `Rgba16Float` 3D CDF volume, built by the
+`histo_cdf_build.wgsl` compute pass, `num_bins` cycled with `B`.
 
 ## Key Technical Notes
 
@@ -327,17 +363,30 @@ median ms: mode 3 = 6.0, mode 4 without the prepass = 6.3 (+5%), mode 4 with it 
   washed-out look. With the fitted window the same scene spans ~38 bins. `Camera::uniform()`
   derives the window each frame; `scene_radius` defaults to 6.0 for the built-in quad scene
   and is set by `fit_to()` for loaded splats.
-- **CDF is an EXCLUSIVE prefix sum, sampled with a half-texel shift**: `cdf[k]` holds the
-  optical depth strictly in *front* of bin k, i.e. tau at the bin's near edge `z = k/N`. Two
-  reasons. First, transmittance in front of a fragment must not include the fragment's own
-  optical depth, nor that of anything else sharing its bin -- negligible for six quads, but
-  dominant for a splat cloud with hundreds of fragments per bin. Second, with the exclusive
-  form, linear filtering between texels interpolates between true bin *edges*, so a fragment
-  a fraction `f` through bin k correctly picks up `f` of that bin's own optical depth.
-  Because a 3D texture samples texel k at `(k+0.5)/N`, the accum shaders sample at
-  `normalized_z + 0.5/num_bins` to line texel centres up with bin edges. Sampling an
-  inclusive CDF at `normalized_z` (the earlier form) reads `tau(z + 0.5/N)` -- half a bin of
-  over-occlusion on top of the self-occlusion.
+- **CDF is stored at bin EDGES (exclusive prefix)**: the value at edge `k` is the optical
+  depth strictly in *front* of `z = k/N`. Two reasons. First, transmittance in front of a
+  fragment must not include the fragment's own optical depth, nor that of anything else
+  sharing its bin -- negligible for six quads, but dominant for a splat cloud with hundreds
+  of fragments per bin. Second, interpolating between edge values means a fragment a
+  fraction `f` through bin k correctly picks up `f` of that bin's own optical depth. Mode
+  3 stores edges 1..16 directly in the CDF channels (edge 0 is implicit zero) and lerps
+  between the two straddling edges in `cdf_at()`; mode 4's 3D volume expresses the same
+  convention as a half-texel shift, sampling at `normalized_z + 0.5/num_bins` because a 3D
+  texture samples texel k at `(k+0.5)/N`. Sampling an inclusive CDF at `normalized_z` (the
+  earliest form) read `tau(z + 0.5/N)` -- half a bin of over-occlusion on top of the
+  self-occlusion.
+- **Scatter and gather must share a smooth basis** (the Friederichs et al. GI 2021 lesson
+  behind the mode 3 rework). The gather side was always interpolated -- bilinear across
+  tiles, linear across bins -- but the scatter side was hard-binned in both axes: a
+  fragment dumped 100% of its optical depth into exactly one (tile, bin) while a pixel
+  near a tile edge *read* a 50/50 blend of tiles it wrote nothing/everything into. The
+  interpolated CDF field was C0 but its content snapped as geometry crossed boundaries
+  (grid-aligned popping), and C0 kinks Mach-band -- amplified by `exp(-tau * CDF)` exactly
+  where the cloud is densest. Fixes now in place: `tent_deposit()` splits each fragment's
+  optical depth linearly between its two straddling bins (free with channel-packed MRTs;
+  it used to cost a second atomic), and the accum gather is a cubic B-spline across tiles
+  (C1). The remaining asymmetry is spatial scatter (still box-per-tile, since a fragment
+  can only blend into its own pixel) -- covered from the gather side.
 - **Why the transmittance weight is exact**: `tau_total = -ln(R_prev)` and
   `CDF(z) = tau(z)/tau_total`, so `pow(R_prev, CDF(z)) = exp(-tau(z)) = T(z)`, the exact
   transmittance in front of the fragment. Since `sum(a_i * T_i)` telescopes to
@@ -373,10 +422,12 @@ median ms: mode 3 = 6.0, mode 4 without the prepass = 6.3 (+5%), mode 4 with it 
   which is far too much memory) address it. Mode 4 addresses it a different way, by
   demoting the CDF from a weight to an ordering key and repairing what is left with a
   per-pixel front-surface prepass -- which is why its tile-size curve is nearly flat where
-  mode 3's is steep. Cost at 1080p, histogram + CDF volume: 32px = 1.6 MB,
-  8px = 25 MB, 4px = 100 MB. The CDF volume must stay `Rgba16Float` even though only `.r` is
-  used, because `r32float` is not filterable in core WebGPU without `float32-filterable`, and
-  the trilinear sample is load-bearing.
+  mode 3's is steep. Mode 3's channel-packed storage costs 12 tile-res RGBA16F textures
+  (hist + 2x CDF) = 96 bytes/tile: 8px at 1080p is ~3.1 MB where the old 64-bin
+  buffer+volume was ~25 MB. Mode 4's 3D CDF volume must stay `Rgba16Float` even though
+  only `.r` is used, because `r32float` is not filterable in core WebGPU without
+  `float32-filterable`, and the trilinear sample is load-bearing; mode 3's 2D textures are
+  fully packed instead, with the depth lerp done in ALU.
 - **Store optical depth, not revealage.** These are the same quantity --
   `prod(1 - a_i) = exp(sum(ln(1 - a_i))) = exp(-tau)` -- but they are not equally
   representable. The original design accumulated the *product* multiplicatively into an
@@ -435,9 +486,18 @@ median ms: mode 3 = 6.0, mode 4 without the prepass = 6.3 (+5%), mode 4 with it 
   which also moves mode 1's blending into gamma space) or pre-compensate into the sRGB
   surface (`srgb_to_linear(linear_to_srgb(avg_color) * alpha)`, which keeps linear blending
   at the cost of a round trip).
-- **Atomics in fragment shaders**: `atomicAdd` on `var<storage, read_write>` IS allowed in fragment shaders per WGSL spec. The underlying Vulkan feature `fragmentStoresAndAtomics` is widely supported on desktop.
-- **CDF build via compute shader**: A single workgroup of 256 threads performs a parallel Hillis-Steele inclusive prefix sum, normalizes, writes CDF, and clears the histogram. Dispatched as `(1,1,1)` between the accum and composite render passes.
-- **First frame**: CDF buffer initialized to linear fallback values `(1/256, 2/256, ..., 256/256)` with total optical depth = `257/256` on creation (`src/renderer.rs` `new()`). Histogram starts zeroed.
+- **Atomics in fragment shaders** (mode 4 only, since the mode 3 rework): `atomicAdd` on
+  `var<storage, read_write>` IS allowed in fragment shaders per WGSL spec. The underlying
+  Vulkan feature `fragmentStoresAndAtomics` is widely supported on desktop, but fragment
+  storage writes disable early-Z/hidden-surface fast paths on mobile tilers and the
+  same-address contention serializes on dense splat clouds -- which is exactly why mode 3
+  moved to rasterized binning (histogram = scatter + accumulate = rasterizer + blend unit).
+- **CDF build**: mode 3 resolves per-pixel in a fragment pass (16-bin scan in registers,
+  see `histo_cdf_resolve.wgsl`); mode 4 keeps the one-workgroup-per-tile Hillis-Steele
+  compute pass over the atomic buffer, which also clears the histogram.
+- **First frame** (mode 3): the CDF textures start zero-initialized, so frame 0 runs with
+  uniform weights and frame 1 onward is equalized; empty tiles fall back to a linear ramp
+  in the resolve. The harnesses' priming frames absorb the warm-up.
 - **Temporal lag**: 1-frame delay is acceptable. CDF adapts smoothly as camera moves.
 - **R16Float for optical depth**: Additive blend `(One, One)` accumulates `tau = sum(-ln(1 - alpha))`. `r16float` is renderable and blendable in core WebGPU; `r32float` would need the `float32-blendable` feature, and f16 already resolves `tau` to better than 0.1% across the 0-30 range these scenes need.
 - **Rgba16Float for accum**: Supports blending without the `float32-blendable` feature.
@@ -620,8 +680,9 @@ which is a useful check that neither reimplemented the metric wrong.
 - `T`: Cycle the histogram tile size (32/16/8/4 px). The single biggest quality knob for
   mode 3 -- see *Tile size is the dominant quality knob* above. Sizes that would exceed the
   device's storage-binding limit are skipped.
-- `B`: Cycle the histogram bin count (32/64/128/256). Sets the CDF's *depth* resolution,
-  which is a different axis from what `T` controls. Sizes exceeding the device's
+- `B`: Cycle the histogram bin count (32/64/128/256) -- **mode 4 only** since the mode 3
+  rework fixed its bin count at 16 channel-packed bins. Sets mode 4's CDF *depth*
+  resolution, a different axis from what `T` controls. Sizes exceeding the device's
   storage-binding limit are skipped.
 - `R`: Reset the camera to its framing of the loaded scene
 - `Escape`: Exit

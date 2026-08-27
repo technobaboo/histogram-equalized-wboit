@@ -10,6 +10,9 @@ pub struct SplatPipelines {
     pub front_pipeline: wgpu::RenderPipeline,
     pub wboit_pipeline: wgpu::RenderPipeline,
     pub histo_pipeline: wgpu::RenderPipeline,
+    /// Mode 3's binning pass: the same EWA projection rasterized at one pixel per tile,
+    /// blending optical depth into the 16-channel tile histogram.
+    pub binning_pipeline: wgpu::RenderPipeline,
     pub sliced_pipeline: wgpu::RenderPipeline,
     pub splat_bgl: wgpu::BindGroupLayout,
 }
@@ -70,6 +73,8 @@ impl SplatPipelines {
         surface_format: wgpu::TextureFormat,
         camera_bgl: &wgpu::BindGroupLayout,
         histo_accum_bgl: &wgpu::BindGroupLayout,
+        slice_accum_bgl: &wgpu::BindGroupLayout,
+        binning_params_bgl: &wgpu::BindGroupLayout,
     ) -> Self {
         let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
@@ -224,11 +229,18 @@ impl SplatPipelines {
             cache: None,
         });
 
-        let histo_shader = shader(
-            device,
-            "splat histo shader",
-            include_str!("../../shaders/splat_histo.wgsl"),
-        );
+        let histo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("splat histo shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}\n{}",
+                    include_str!("../../shaders/splat_common.wgsl"),
+                    include_str!("../../shaders/cdf_sample_common.wgsl"),
+                    include_str!("../../shaders/splat_histo.wgsl"),
+                )
+                .into(),
+            ),
+        });
         let histo_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("splat histo layout"),
             bind_group_layouts: &[camera_bgl, &splat_bgl, histo_accum_bgl],
@@ -256,12 +268,54 @@ impl SplatPipelines {
             cache: None,
         });
 
-        // Mode 4: same accumulation bind groups as mode 3, four slabs instead of an
-        // accum/optical-depth pair.
+        // Mode 3's binning pass: no depth attachment, four additive tile-histogram
+        // targets, nothing bound beyond the params uniform.
+        let binning_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("splat binning shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}\n{}",
+                    include_str!("../../shaders/splat_common.wgsl"),
+                    include_str!("../../shaders/binning_common.wgsl"),
+                    include_str!("../../shaders/splat_binning.wgsl"),
+                )
+                .into(),
+            ),
+        });
+        let binning_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("splat binning layout"),
+            bind_group_layouts: &[camera_bgl, &splat_bgl, binning_params_bgl],
+            immediate_size: 0,
+        });
+        let binning_targets = crate::pipeline::histogram_wboit::binning_targets();
+        let binning_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("splat binning pipeline"),
+            layout: Some(&binning_layout),
+            vertex: wgpu::VertexState {
+                module: &binning_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &binning_shader,
+                entry_point: Some("fs_main"),
+                targets: &binning_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Mode 4: the old histogram-buffer accumulation bind groups, four slabs instead
+        // of an accum/optical-depth pair.
         let sliced_shader = sliced_shader(device);
         let sliced_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("splat sliced layout"),
-            bind_group_layouts: &[camera_bgl, &splat_bgl, histo_accum_bgl],
+            bind_group_layouts: &[camera_bgl, &splat_bgl, slice_accum_bgl],
             immediate_size: 0,
         });
         let slice_targets = crate::pipeline::sliced_oit::slice_targets();
@@ -323,6 +377,7 @@ impl SplatPipelines {
             front_pipeline,
             wboit_pipeline,
             histo_pipeline,
+            binning_pipeline,
             sliced_pipeline,
             splat_bgl,
         }
