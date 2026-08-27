@@ -1,5 +1,5 @@
 @group(0) @binding(0) var accum_tex: texture_2d<f32>;
-@group(0) @binding(1) var revealage_tex: texture_2d<f32>;
+@group(0) @binding(1) var optical_depth_tex: texture_2d<f32>;
 
 @group(1) @binding(0) var<uniform> use_revealage: u32;
 
@@ -27,11 +27,14 @@ fn fs_main(in: CompositeOutput) -> @location(0) vec4<f32> {
     // Avoid division by zero
     let avg_color = accum.rgb / max(accum.a, 1e-5);
 
-    // Compute alpha: use revealage if enabled, otherwise use exponential approximation
+    // Exact alpha from accumulated optical depth, or the weighted-sum approximation
     var alpha: f32;
     if (use_revealage != 0u) {
-        let revealage = textureLoad(revealage_tex, coords, 0).r;
-        alpha = 1.0 - revealage;
+        // Exact. Revealage is the product of (1 - alpha) over every fragment, which is
+        // exp of the negated sum of their optical depths -- exactly what this texture
+        // holds, so no precision is lost recovering it.
+        let tau = textureLoad(optical_depth_tex, coords, 0).r;
+        alpha = 1.0 - exp(-tau);
     } else {
         // Exponential approximation: alpha = 1 - exp(-weighted_alpha_sum)
         alpha = 1.0 - exp(-accum.a);

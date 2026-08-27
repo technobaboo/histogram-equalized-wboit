@@ -60,18 +60,20 @@ impl NaiveWboitPipeline {
                         }),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
-                    // revealage (R8Unorm, multiplicative: Zero, OneMinusSrc)
+                    // optical depth (R16Float, additive). Storing sum(-ln(1-a)) rather than
+                    // the product of (1-a) keeps the full dynamic range: revealage is
+                    // recovered exactly as exp(-tau) at composite time.
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::R8Unorm,
+                        format: wgpu::TextureFormat::R16Float,
                         blend: Some(wgpu::BlendState {
                             color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::Zero,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
                                 operation: wgpu::BlendOperation::Add,
                             },
                             alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::Zero,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
                                 operation: wgpu::BlendOperation::Add,
                             },
                         }),

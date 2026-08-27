@@ -1,7 +1,7 @@
 use crate::camera::Camera;
 use crate::renderer::{RenderMode, Renderer};
 use crate::scene::Scene;
-use crate::splats::{SplatScene, Sorter};
+use crate::splats::{Sorter, SplatScene};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -54,9 +54,9 @@ impl ApplicationHandler for App {
         }
 
         let title = if self.splats.is_some() {
-            "3DGS WBOIT Demo - 1/2/3 modes, A revealage, T tile, C cap, [ ] splat size, R reset"
+            "3DGS WBOIT Demo - 1/2/3 modes, A exact-alpha, T tile, B bins, C cap, [ ] size, R reset"
         } else {
-            "WBOIT Demo - 1/2/3 modes, A revealage, T histogram tile, M meshes"
+            "WBOIT Demo - 1/2/3 modes, A exact-alpha, T tile, B bins, M meshes"
         };
         let attrs = Window::default_attributes()
             .with_title(title)
@@ -88,8 +88,7 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(new_size) => {
                 if let Some(renderer) = &mut self.renderer {
                     self.camera.aspect = new_size.width as f32 / new_size.height.max(1) as f32;
-                    self.camera.viewport =
-                        (new_size.width as f32, new_size.height.max(1) as f32);
+                    self.camera.viewport = (new_size.width as f32, new_size.height.max(1) as f32);
                     renderer.resize(new_size.width, new_size.height);
                 }
             }
@@ -120,12 +119,12 @@ impl ApplicationHandler for App {
                             "a" | "A" => {
                                 renderer.use_revealage = !renderer.use_revealage;
                                 println!(
-                                    "Revealage: {} (alpha computed via {})",
+                                    "Exact alpha: {} (computed via {})",
                                     if renderer.use_revealage { "ON" } else { "OFF" },
                                     if renderer.use_revealage {
-                                        "revealage buffer"
+                                        "1 - exp(-tau) from the optical-depth buffer"
                                     } else {
-                                        "exp(-accum.a) approximation"
+                                        "1 - exp(-accum.a) approximation"
                                     }
                                 );
                             }
@@ -138,6 +137,13 @@ impl ApplicationHandler for App {
                                 println!(
                                     "Meshes: {}",
                                     if self.scene.show_meshes { "ON" } else { "OFF" }
+                                );
+                            }
+                            "b" | "B" => {
+                                let (bins, mb) = renderer.cycle_bin_count();
+                                println!(
+                                    "Histogram bins: {bins} ({mb:.1} MB) \
+- more bins separate layers that sit close together in depth"
                                 );
                             }
                             "t" | "T" => {

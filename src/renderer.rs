@@ -7,7 +7,14 @@ use crate::scene::Scene;
 use crate::splats::SplatScene;
 use crate::vertex::{CameraUniform, HistogramParams, ObjectUniform, SplatParams};
 
-const NUM_DEPTH_BINS: u32 = 64;
+/// Depth-bin counts for the histogram, cycled at runtime with `B`. The largest entry must
+/// match `MAX_BINS` and the workgroup size in `shaders/histo_cdf_build.wgsl`.
+///
+/// Where tile size sets the CDF's *spatial* resolution, this sets its *depth* resolution:
+/// two layers closer together than one bin cannot be separated, so a fragment on the front
+/// one is credited with part of the back one's optical depth and vice versa.
+const BIN_COUNT_STEPS: [u32; 4] = [32, 64, 128, 256];
+const DEFAULT_NUM_BINS: u32 = 64;
 /// Screen-space tile edge, in pixels, for the depth histogram. Cycled at runtime with `T`.
 ///
 /// This is the single most important quality knob in mode 3. The CDF is per-tile but the
@@ -80,13 +87,13 @@ pub struct Renderer {
     /// replace the quad/mesh scene entirely.
     splats: Option<SplatGpuState>,
 
-    // WBOIT textures (double-buffered revealage for transmittance feedback)
+    // WBOIT textures (double-buffered optical depth for transmittance feedback)
     accum_texture_view: wgpu::TextureView,
-    revealage_views: [wgpu::TextureView; 2],
+    optical_depth_views: [wgpu::TextureView; 2],
     frame_index: usize,
 
     // Double-buffered bind groups indexed by frame_index:
-    // [i] renders to revealage_views[i], reads prev from revealage_views[1-i]
+    // [i] renders to optical_depth_views[i], reads prev from optical_depth_views[1-i]
     wboit_composite_bind_groups: [wgpu::BindGroup; 2],
     histo_accum_bind_groups: [wgpu::BindGroup; 2],
     histo_composite_tex_bind_groups: [wgpu::BindGroup; 2],
@@ -104,6 +111,7 @@ pub struct Renderer {
     histo_composite_flag_bind_group: wgpu::BindGroup,
     histo_params: HistogramParams,
     tile_size: u32,
+    num_bins: u32,
 
     // Bind group layouts (needed for recreation)
     #[allow(dead_code)]
@@ -247,7 +255,7 @@ impl Renderer {
             create_depth_texture(&device, surface_config.width, surface_config.height);
 
         // WBOIT textures (double-buffered revealage)
-        let (accum_texture_view, revealage_views) =
+        let (accum_texture_view, optical_depth_views) =
             create_wboit_textures(&device, surface_config.width, surface_config.height);
 
         let wboit_composite_bind_groups = std::array::from_fn(|i| {
@@ -261,7 +269,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&revealage_views[i]),
+                        resource: wgpu::BindingResource::TextureView(&optical_depth_views[i]),
                     },
                 ],
             })
@@ -278,25 +286,26 @@ impl Renderer {
 
         // Tiled histogram resources
         let tile_size = DEFAULT_TILE_SIZE;
+        let num_bins = DEFAULT_NUM_BINS;
         let tiles_x = surface_config.width.div_ceil(tile_size);
         let tiles_y = surface_config.height.div_ceil(tile_size);
 
         let histo_params = HistogramParams {
             tile_count_x: tiles_x,
             tile_count_y: tiles_y,
-            num_bins: NUM_DEPTH_BINS,
+            num_bins,
             tile_size,
         };
 
         let histogram_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("histogram buffer"),
-            size: (tiles_x as u64) * (tiles_y as u64) * (NUM_DEPTH_BINS as u64) * 4,
+            size: (tiles_x as u64) * (tiles_y as u64) * (num_bins as u64) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let (cdf_texture, cdf_texture_view) =
-            create_cdf_texture(&device, tiles_x, tiles_y, NUM_DEPTH_BINS);
+            create_cdf_texture(&device, tiles_x, tiles_y, num_bins);
         let _ = cdf_texture; // view keeps texture alive via Arc internally
 
         let cdf_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -342,7 +351,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: wgpu::BindingResource::TextureView(&revealage_views[1 - i]),
+                        resource: wgpu::BindingResource::TextureView(&optical_depth_views[1 - i]),
                     },
                 ],
             })
@@ -360,7 +369,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&revealage_views[i]),
+                        resource: wgpu::BindingResource::TextureView(&optical_depth_views[i]),
                     },
                 ],
             })
@@ -412,7 +421,7 @@ impl Renderer {
             splat_pipelines,
             splats: None,
             accum_texture_view,
-            revealage_views,
+            optical_depth_views,
             frame_index: 0,
             wboit_composite_bind_groups,
             histo_accum_bind_groups,
@@ -427,6 +436,7 @@ impl Renderer {
             histo_composite_flag_bind_group,
             histo_params,
             tile_size,
+            num_bins,
             camera_bgl,
             object_bgl,
         }
@@ -642,9 +652,9 @@ impl Renderer {
 
         self.depth_texture_view = create_depth_texture(&self.device, width, height);
 
-        let (accum_view, revealage_views) = create_wboit_textures(&self.device, width, height);
+        let (accum_view, optical_depth_views) = create_wboit_textures(&self.device, width, height);
         self.accum_texture_view = accum_view;
-        self.revealage_views = revealage_views;
+        self.optical_depth_views = optical_depth_views;
 
         // Recreate double-buffered bind groups
         self.wboit_composite_bind_groups = std::array::from_fn(|i| {
@@ -658,7 +668,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&self.revealage_views[i]),
+                        resource: wgpu::BindingResource::TextureView(&self.optical_depth_views[i]),
                     },
                 ],
             })
@@ -675,7 +685,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&self.revealage_views[i]),
+                        resource: wgpu::BindingResource::TextureView(&self.optical_depth_views[i]),
                     },
                 ],
             })
@@ -694,19 +704,19 @@ impl Renderer {
         self.histo_params = HistogramParams {
             tile_count_x: tiles_x,
             tile_count_y: tiles_y,
-            num_bins: NUM_DEPTH_BINS,
+            num_bins: self.num_bins,
             tile_size: self.tile_size,
         };
 
         self.histogram_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("histogram buffer"),
-            size: (tiles_x as u64) * (tiles_y as u64) * (NUM_DEPTH_BINS as u64) * 4,
+            size: (tiles_x as u64) * (tiles_y as u64) * (self.num_bins as u64) * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let (cdf_texture, cdf_texture_view) =
-            create_cdf_texture(&self.device, tiles_x, tiles_y, NUM_DEPTH_BINS);
+            create_cdf_texture(&self.device, tiles_x, tiles_y, self.num_bins);
         let _ = cdf_texture;
         self.cdf_texture_view = cdf_texture_view;
 
@@ -739,31 +749,32 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: wgpu::BindingResource::TextureView(&self.revealage_views[1 - i]),
+                        resource: wgpu::BindingResource::TextureView(
+                            &self.optical_depth_views[1 - i],
+                        ),
                     },
                 ],
             })
         });
 
-        self.cdf_build_bind_group =
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cdf build bg"),
-                layout: &self.histogram_wboit.cdf_build_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.histogram_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&self.cdf_texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.histo_params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+        self.cdf_build_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cdf build bg"),
+            layout: &self.histogram_wboit.cdf_build_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.histogram_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.cdf_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.histo_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
     }
 
     /// Step to the next tile size and rebuild. Sizes whose histogram would exceed the
@@ -777,21 +788,41 @@ impl Renderer {
             .unwrap_or(0);
         for step in 1..=TILE_SIZE_STEPS.len() {
             let candidate = TILE_SIZE_STEPS[(cur + step) % TILE_SIZE_STEPS.len()];
-            if self.tiled_bytes(candidate).0 <= limit {
+            if self.tiled_bytes_with(candidate, self.num_bins).0 <= limit {
                 self.tile_size = candidate;
                 break;
             }
         }
         self.rebuild_tiled_histogram();
-        let (hist, cdf) = self.tiled_bytes(self.tile_size);
+        let (hist, cdf) = self.tiled_bytes_with(self.tile_size, self.num_bins);
         (self.tile_size, (hist + cdf) as f64 / 1.0e6)
     }
 
+    /// Step to the next histogram bin count and rebuild, skipping any that would blow the
+    /// storage-binding limit. Returns the new bin count and total footprint in MB.
+    pub fn cycle_bin_count(&mut self) -> (u32, f64) {
+        let limit = self.device.limits().max_storage_buffer_binding_size as u64;
+        let cur = BIN_COUNT_STEPS
+            .iter()
+            .position(|&b| b == self.num_bins)
+            .unwrap_or(0);
+        for step in 1..=BIN_COUNT_STEPS.len() {
+            let candidate = BIN_COUNT_STEPS[(cur + step) % BIN_COUNT_STEPS.len()];
+            if self.tiled_bytes_with(self.tile_size, candidate).0 <= limit {
+                self.num_bins = candidate;
+                break;
+            }
+        }
+        self.rebuild_tiled_histogram();
+        let (hist, cdf) = self.tiled_bytes_with(self.tile_size, self.num_bins);
+        (self.num_bins, (hist + cdf) as f64 / 1.0e6)
+    }
+
     /// Bytes used by the histogram buffer and the CDF volume at a given tile size.
-    fn tiled_bytes(&self, tile_size: u32) -> (u64, u64) {
+    fn tiled_bytes_with(&self, tile_size: u32, num_bins: u32) -> (u64, u64) {
         let tiles = self.surface_config.width.div_ceil(tile_size) as u64
             * self.surface_config.height.div_ceil(tile_size) as u64;
-        let bins = NUM_DEPTH_BINS as u64;
+        let bins = num_bins as u64;
         // Histogram is one u32 per bin; the CDF volume is Rgba16Float, so 8 bytes.
         (tiles * bins * 4, tiles * bins * 8)
     }
@@ -823,18 +854,18 @@ impl Renderer {
             Vec::new()
         } else {
             scene
-            .objects
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| {
-                if o.is_extra_mesh {
-                    scene.show_meshes
-                } else {
-                    true
-                }
-            })
-            .map(|(i, _)| i)
-            .collect()
+                .objects
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| {
+                    if o.is_extra_mesh {
+                        scene.show_meshes
+                    } else {
+                        true
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect()
         };
 
         // Sort back-to-front for alpha blend mode
@@ -963,15 +994,11 @@ impl Renderer {
                         depth_slice: None,
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &self.revealage_views[fi],
+                        view: &self.optical_depth_views[fi],
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 1.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: 0.0,
-                            }),
+                            // Optical depth starts at zero: nothing absorbed yet.
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -1043,15 +1070,11 @@ impl Renderer {
                         depth_slice: None,
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &self.revealage_views[fi],
+                        view: &self.optical_depth_views[fi],
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 1.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: 0.0,
-                            }),
+                            // Optical depth starts at zero: nothing absorbed yet.
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -1079,7 +1102,11 @@ impl Renderer {
             });
             pass.set_pipeline(&self.histogram_wboit.cdf_build_pipeline);
             pass.set_bind_group(0, &self.cdf_build_bind_group, &[]);
-            pass.dispatch_workgroups(self.histo_params.tile_count_x, self.histo_params.tile_count_y, 1);
+            pass.dispatch_workgroups(
+                self.histo_params.tile_count_x,
+                self.histo_params.tile_count_y,
+                1,
+            );
         }
 
         // Pass 3: Composite
@@ -1150,10 +1177,10 @@ fn create_wboit_textures(
         view_formats: &[],
     });
 
-    // Double-buffered revealage: both are render targets and texture inputs
-    let revealage_views = std::array::from_fn(|i| {
+    // Double-buffered optical depth: both are render targets and texture inputs
+    let optical_depth_views = std::array::from_fn(|i| {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(&format!("revealage texture {i}")),
+            label: Some(&format!("optical depth texture {i}")),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -1162,7 +1189,7 @@ fn create_wboit_textures(
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::R16Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
@@ -1171,7 +1198,7 @@ fn create_wboit_textures(
 
     (
         accum.create_view(&wgpu::TextureViewDescriptor::default()),
-        revealage_views,
+        optical_depth_views,
     )
 }
 

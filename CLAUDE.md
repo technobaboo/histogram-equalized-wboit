@@ -148,7 +148,7 @@ Single pass:
 **Pass 1 - Accumulation (MRT):**
 - Color 0: `Rgba16Float` accum texture (clear to 0,0,0,0)
   - Blend: `One + One` (additive)
-- Color 1: `R8Unorm` revealage texture (clear to 1,0,0,0)
+- Color 1: `R16Float` optical-depth texture (clear to 0)
   - Blend: `Zero + OneMinusSrc` (multiplicative)
 - Depth: depth texture (write disabled, depth test only)
 - Fragment outputs: `(premul_color * w, alpha * w)` to color0, `alpha` to color1
@@ -159,8 +159,8 @@ Single pass:
 **Pass 2 - Composite (fullscreen triangle):**
 - Color target: swapchain (clear to background)
 - Blend: `SrcAlpha / OneMinusSrcAlpha`
-- Sample accum and revealage textures
-- Output: `color = accum.rgb / max(accum.a, 1e-5)`, `alpha = 1 - revealage`
+- Sample accum and optical-depth textures
+- Output: `color = accum.rgb / max(accum.a, 1e-5)`, `alpha = 1 - exp(-tau)`
 
 ### Mode 3: Histogram-Equalized WBOIT (global, 3 passes)
 > Pipelines: `src/pipeline/histogram_wboit.rs` (`accum_pipeline` + `cdf_build_pipeline` (compute) + `composite_pipeline`)
@@ -169,7 +169,7 @@ Single pass:
 > Buffer setup: `src/renderer.rs` `new()` (histogram_buffer, cdf_buffer, histo_params_buffer) and `resize()`
 
 **Pass 1 - Accumulation + Optical Depth Histogram Recording:**
-- Same MRT setup as Mode 2 (accum `Rgba16Float` + revealage `R8Unorm`)
+- Same MRT setup as Mode 2 (accum `Rgba16Float` + optical depth `R16Float`)
 - Additional bind groups: histogram buffer (`read_write`, atomic), CDF buffer (`read`), params uniform
 - Fragment shader does:
   1. Compute linear depth `z` from clip-space (using `clip_position.w`)
@@ -179,7 +179,7 @@ Single pass:
   5. Read CDF from **previous frame** with piecewise-linear interpolation between `cdf[bin-1]` and `cdf[bin]`
   6. Reconstruct absolute cumulative optical depth: `tau = interpolated_cdf * cdf[num_bins]`
   7. Weight: `w = exp(-tau)` — exact transmittance before this layer (per-bin resolution)
-  8. Output to MRT: `(premul_color * w, alpha * w)` to accum, `alpha` to revealage
+  8. Output to MRT: `(premul_color * w, alpha * w)` to accum, `tau` to optical depth
 
 **Pass 2 - CDF Build (compute shader):**
 - Dispatch: `(1, 1, 1)` workgroups, `@workgroup_size(256, 1, 1)`
@@ -190,8 +190,8 @@ Single pass:
 
 **Pass 3 - Composite (fullscreen triangle):**
 - Color target: swapchain (clear to background)
-- Bind groups: accum texture, revealage texture, flag uniform
-- Same composite math as Mode 2: read accum+revealage, output blended color
+- Bind groups: accum texture, optical-depth texture, flag uniform
+- Same composite math as Mode 2: read accum + optical depth, output blended color
 
 ### Histogram Buffer Layout
 > Created in `src/renderer.rs` `new()` and recreated in `resize()`
@@ -236,7 +236,7 @@ Single pass:
 - **Why the transmittance weight is exact**: `tau_total = -ln(R_prev)` and
   `CDF(z) = tau(z)/tau_total`, so `pow(R_prev, CDF(z)) = exp(-tau(z)) = T(z)`, the exact
   transmittance in front of the fragment. Since `sum(a_i * T_i)` telescopes to
-  `1 - prod(1 - a_i)`, the composite `avg_color * (1 - revealage)` reduces algebraically to
+  `1 - prod(1 - a_i)`, the composite `avg_color * (1 - exp(-tau))` reduces algebraically to
   the exact front-to-back integral. Mode 3's error is therefore entirely in how well the
   binned, tiled, one-frame-late CDF approximates the true `tau(z)`.
 - **Tile size is the dominant quality knob in mode 3** (`TILE_SIZE_STEPS`, cycled with `T`,
@@ -244,7 +244,7 @@ Single pass:
   `exp(-tau_pixel * CDF_tile(z_i))`, but the correct transmittance is `exp(-tau_pixel(z_i))`.
   Those agree **only if** `CDF_tile(z) == tau_pixel(z) / tau_pixel` -- that is, only if the
   tile's *normalized* depth profile matches the pixel's. The magnitude of optical depth is
-  per-pixel and correct (it comes from the revealage texture); only its **distribution in
+  per-pixel and correct (it comes from the optical-depth texture); only its **distribution in
   depth** is borrowed from the tile.
 
   The failure is directional: always toward **under-occlusion**. Any pixel in the tile that
@@ -269,11 +269,47 @@ Single pass:
   8px = 25 MB, 4px = 100 MB. The CDF volume must stay `Rgba16Float` even though only `.r` is
   used, because `r32float` is not filterable in core WebGPU without `float32-filterable`, and
   the trilinear sample is load-bearing.
+- **Store optical depth, not revealage.** These are the same quantity --
+  `prod(1 - a_i) = exp(sum(ln(1 - a_i))) = exp(-tau)` -- but they are not equally
+  representable. The original design accumulated the *product* multiplicatively into an
+  **R8Unorm** target, which bottoms out at `1/255`: any pixel with `tau > ln(255) = 5.54`
+  stored 0, and its true optical depth was gone. Mode 3 then had to recover `tau` as
+  `-ln(prev_R)` and floor the result against a magic constant, so that floor became the
+  assumed `tau` for *every* saturated pixel.
+
+  That is fatal for splats and invisible for quads. A splat scene builds opacity from many
+  low-alpha Gaussians and routinely reaches `tau` of 20-30 per pixel, so essentially every
+  solid pixel saturates. Six quads at `alpha ~ 0.4` give `tau ~ 3`, i.e. `R ~ 13/255` --
+  comfortably inside the format. And because transmittance is *exponential* in `tau`, a
+  shortfall of `d_tau` multiplies a background fragment's weight by `e^d_tau`; occlusion is
+  exactly the front/back weight ratio, so under-counting `tau` by 10 makes the background
+  22000x too bright. That was the see-through-figure artefact.
+
+  The fix is to accumulate `tau` **additively** into an `R16Float` target instead. The
+  information content is identical, but the log form is the well-conditioned one: `tau`
+  grows linearly and fits f16 exactly, where `R` decays exponentially toward zero and
+  destroys itself in 8 bits. Everything downstream simplifies:
+  - the weight becomes `exp(-prev_tau * CDF(z))` -- no `log`, no `pow`, no floor, no guess
+  - the composite's alpha becomes `1 - exp(-tau)`, which is now exact rather than
+    quantized
+  - the accum pass writes `tau` that mode 3 has already computed for its histogram
+
+  General lesson worth keeping: **put the precision budget in the space where the quantity
+  is linear.** Storing a transmittance is storing `e^-x` at fixed point; storing `x` costs
+  the same bandwidth and loses nothing.
+- **Three independent resolution limits govern mode 3.** They fail in different ways and are
+  fixed by different knobs, so it is worth keeping them apart:
+  - *spatial* -- tile size (`T`). Mixes pixels with different depth profiles into one CDF.
+  - *depth* -- bin count (`B`). Two layers closer than one bin cannot be separated, so each
+    is credited with part of the other's optical depth.
+  - *magnitude* -- how much total optical depth a pixel can express. Was the tightest of
+    the three while revealage lived in R8Unorm; resolved by storing `tau` in R16Float, per
+    the note above.
 - **Atomics in fragment shaders**: `atomicAdd` on `var<storage, read_write>` IS allowed in fragment shaders per WGSL spec. The underlying Vulkan feature `fragmentStoresAndAtomics` is widely supported on desktop.
 - **CDF build via compute shader**: A single workgroup of 256 threads performs a parallel Hillis-Steele inclusive prefix sum, normalizes, writes CDF, and clears the histogram. Dispatched as `(1,1,1)` between the accum and composite render passes.
 - **First frame**: CDF buffer initialized to linear fallback values `(1/256, 2/256, ..., 256/256)` with total optical depth = `257/256` on creation (`src/renderer.rs` `new()`). Histogram starts zeroed.
 - **Temporal lag**: 1-frame delay is acceptable. CDF adapts smoothly as camera moves.
-- **R8Unorm for revealage**: Well-tested, universally blendable. Multiplicative blend `(Zero, OneMinusSrc)` implements product of `(1 - alpha)`.
+- **R16Float for optical depth**: Additive blend `(One, One)` accumulates `tau = sum(-ln(1 - alpha))`. `r16float` is renderable and blendable in core WebGPU; `r32float` would need the `float32-blendable` feature, and f16 already resolves `tau` to better than 0.1% across the 0-30 range these scenes need.
 - **Rgba16Float for accum**: Supports blending without the `float32-blendable` feature.
 - **Shader loading**: `format!("{}\n{}", common_wgsl, specific_wgsl)` concatenation since WGSL has no `#include`. Used in all three pipeline files via `include_str!`.
 - **CDF buffer as non-atomic storage**: The CDF buffer is written by compute shader (pass 2) and read by fragment shader (pass 1 of next frame). Since these are in different passes of different frames, there's no synchronization issue. Use `var<storage, read_write>` with plain `f32` (not atomic).
@@ -374,12 +410,15 @@ sorts the newest camera). At orbit speeds the one-frame lag is not visible.
 
 - `1` / `2` / `3`: Switch rendering mode (sets `renderer.mode`)
 - `M`: Toggle mesh visibility (toggles `scene.show_meshes`)
-- `A`: Toggle revealage vs. the `exp(-accum.a)` approximation
+- `A`: Toggle exact alpha (`1 - exp(-tau)`) vs. the `1 - exp(-accum.a)` approximation
 - `C`: (3DGS only) Cycle the render cap: 100% / 50% / 25% / 10% of the scene
 - `[` / `]`: (3DGS only) Shrink / grow splats, for dialling overdraw up and down
 - `T`: Cycle the histogram tile size (32/16/8/4 px). The single biggest quality knob for
   mode 3 -- see *Tile size is the dominant quality knob* above. Sizes that would exceed the
   device's storage-binding limit are skipped.
+- `B`: Cycle the histogram bin count (32/64/128/256). Sets the CDF's *depth* resolution,
+  which is a different axis from what `T` controls. Sizes exceeding the device's
+  storage-binding limit are skipped.
 - `R`: Reset the camera to its framing of the loaded scene
 - `Escape`: Exit
 - Mouse drag (left button): Orbit camera (`camera.on_mouse_move`)

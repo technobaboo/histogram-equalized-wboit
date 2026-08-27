@@ -2,7 +2,10 @@
 
 struct WboitOutput {
     @location(0) accum: vec4<f32>,
-    @location(1) revealage: f32,
+    // Optical depth tau = -ln(1 - alpha), accumulated ADDITIVELY. The product of (1-alpha)
+    // and the sum of -ln(1-alpha) carry identical information, but the log form keeps its
+    // precision where it matters: revealage is recovered exactly as exp(-tau).
+    @location(1) optical_depth: f32,
 };
 
 @vertex
@@ -29,6 +32,6 @@ fn fs_main(in: VertexOutput) -> WboitOutput {
 
     var out: WboitOutput;
     out.accum = vec4<f32>(lit.rgb * alpha * w, alpha * w);
-    out.revealage = alpha;
+    out.optical_depth = -log(max(1.0 - alpha, 1e-6));
     return out;
 }

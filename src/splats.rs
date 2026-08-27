@@ -47,9 +47,7 @@ impl SplatScene {
             let rot = glam::Mat3::from_quat(glam::Quat::from_xyzw(qx, qy, qz, qw));
 
             // M = flip * R * S, and cov = M M^T.
-            let m = glam::Mat3::from_diagonal(FLIP)
-                * rot
-                * glam::Mat3::from_diagonal(s);
+            let m = glam::Mat3::from_diagonal(FLIP) * rot * glam::Mat3::from_diagonal(s);
             let cov = m * m.transpose();
 
             let p = glam::Vec3::from(data.pos[i]) * FLIP;
@@ -58,12 +56,7 @@ impl SplatScene {
                 pos_opacity: [p.x, p.y, p.z, data.opacity[i]],
                 cov_a: [cov.x_axis.x, cov.x_axis.y, cov.x_axis.z, 0.0],
                 cov_b: [cov.y_axis.y, cov.y_axis.z, cov.z_axis.z, 0.0],
-                color: [
-                    data.color[i][0],
-                    data.color[i][1],
-                    data.color[i][2],
-                    0.0,
-                ],
+                color: [data.color[i][0], data.color[i][1], data.color[i][2], 0.0],
             });
         }
 

@@ -50,9 +50,9 @@ impl Scalar {
     fn read_f32(self, b: &[u8]) -> f32 {
         match self {
             Scalar::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            Scalar::F64 => f64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ]) as f32,
+            Scalar::F64 => {
+                f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+            }
             Scalar::U8 => b[0] as f32,
             Scalar::I8 => (b[0] as i8) as f32,
             Scalar::U16 => u16::from_le_bytes([b[0], b[1]]) as f32,
@@ -64,9 +64,7 @@ impl Scalar {
 
     fn read_u32(self, b: &[u8]) -> u32 {
         match self {
-            Scalar::U32 | Scalar::I32 | Scalar::F32 => {
-                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-            }
+            Scalar::U32 | Scalar::I32 | Scalar::F32 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
             Scalar::U16 | Scalar::I16 => u16::from_le_bytes([b[0], b[1]]) as u32,
             Scalar::U8 | Scalar::I8 => b[0] as u32,
             Scalar::F64 => 0,
@@ -177,8 +175,8 @@ fn parse_header(text: &str) -> Result<Vec<Element>, String> {
                 if ty == "list" {
                     return Err("list properties are not supported".into());
                 }
-                let ty = Scalar::from_name(ty)
-                    .ok_or_else(|| format!("unknown property type `{ty}`"))?;
+                let ty =
+                    Scalar::from_name(ty).ok_or_else(|| format!("unknown property type `{ty}`"))?;
                 let name = it.next().unwrap_or("").to_string();
                 let el = elements
                     .last_mut()
@@ -296,11 +294,8 @@ fn load_uncompressed(body: &[u8], vertex: &Element) -> Result<SplatData, String>
         let row = vertex.row(body, i);
 
         out.pos.push([get(row, px), get(row, py), get(row, pz)]);
-        out.scale.push([
-            get(row, s0).exp(),
-            get(row, s1).exp(),
-            get(row, s2).exp(),
-        ]);
+        out.scale
+            .push([get(row, s0).exp(), get(row, s1).exp(), get(row, s2).exp()]);
 
         let q = [get(row, r0), get(row, r1), get(row, r2), get(row, r3)];
         let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
@@ -379,9 +374,24 @@ fn load_compressed(
     // Chunk bounds, 18 floats per chunk. Colour bounds are optional (older exports
     // omit them, in which case the packed colour is used directly).
     let names = [
-        "min_x", "min_y", "min_z", "max_x", "max_y", "max_z", "min_scale_x", "min_scale_y",
-        "min_scale_z", "max_scale_x", "max_scale_y", "max_scale_z", "min_r", "min_g", "min_b",
-        "max_r", "max_g", "max_b",
+        "min_x",
+        "min_y",
+        "min_z",
+        "max_x",
+        "max_y",
+        "max_z",
+        "min_scale_x",
+        "min_scale_y",
+        "min_scale_z",
+        "max_scale_x",
+        "max_scale_y",
+        "max_scale_z",
+        "min_r",
+        "min_g",
+        "min_b",
+        "max_r",
+        "max_g",
+        "max_b",
     ];
     let has_color_bounds = chunk_el.has("min_r");
     let mut chunks = vec![0.0f32; chunk_el.count * 18];
@@ -391,7 +401,13 @@ fn load_compressed(
             chunks[i * 18 + j] = match chunk_el.prop(name) {
                 Some(p) => p.ty.read_f32(&row[p.offset..]),
                 // Identity bounds so the lerp becomes a pass-through.
-                None => if j >= 15 { 1.0 } else { 0.0 },
+                None => {
+                    if j >= 15 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
             };
         }
     }
@@ -400,8 +416,12 @@ fn load_compressed(
     let pr = vertex
         .prop("packed_rotation")
         .ok_or("missing `packed_rotation`")?;
-    let ps = vertex.prop("packed_scale").ok_or("missing `packed_scale`")?;
-    let pc = vertex.prop("packed_color").ok_or("missing `packed_color`")?;
+    let ps = vertex
+        .prop("packed_scale")
+        .ok_or("missing `packed_scale`")?;
+    let pc = vertex
+        .prop("packed_color")
+        .ok_or("missing `packed_color`")?;
 
     let n = vertex.count;
     let mut out = SplatData {

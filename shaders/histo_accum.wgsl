@@ -13,11 +13,14 @@ struct HistoParams {
 @group(2) @binding(1) var cdf_texture: texture_3d<f32>;
 @group(2) @binding(2) var cdf_sampler: sampler;
 @group(2) @binding(3) var<uniform> histo_params: HistoParams;
-@group(2) @binding(4) var prev_revealage_tex: texture_2d<f32>;
+@group(2) @binding(4) var prev_optical_depth_tex: texture_2d<f32>;
 
 struct WboitOutput {
     @location(0) accum: vec4<f32>,
-    @location(1) revealage: f32,
+    // Optical depth tau = -ln(1 - alpha), accumulated ADDITIVELY. The product of (1-alpha)
+    // and the sum of -ln(1-alpha) carry identical information, but the log form keeps its
+    // precision where it matters: the product is recovered exactly as exp(-tau).
+    @location(1) optical_depth: f32,
 };
 
 @vertex
@@ -62,12 +65,15 @@ fn fs_main(in: VertexOutput) -> WboitOutput {
     let w = normalized_z + 0.5 / f32(nb);
     let equalized_z = textureSampleLevel(cdf_texture, cdf_sampler, vec3f(u, v, w), 0.0).r;
 
-    // Transmittance weight from previous frame's per-pixel revealage
-    let prev_R = textureLoad(prev_revealage_tex, vec2<i32>(in.clip_position.xy), 0).r;
-    let wt = pow(max(prev_R, 1e-4), equalized_z);
+    // Transmittance in front of this fragment. This used to recover tau by taking the log
+    // of an 8-bit revealage texel and flooring it against a magic constant, because
+    // R8Unorm bottoms out at 1/255 and discarded any tau above 5.54. Now tau is read back
+    // directly, so this is just exp(-tau * CDF(z)) -- nothing clamped, guessed, or lost.
+    let prev_tau = textureLoad(prev_optical_depth_tex, vec2<i32>(in.clip_position.xy), 0).r;
+    let wt = exp(-prev_tau * equalized_z);
 
     var out: WboitOutput;
     out.accum = vec4<f32>(lit.rgb * alpha * wt, alpha * wt);
-    out.revealage = alpha;
+    out.optical_depth = optical_depth;
     return out;
 }
