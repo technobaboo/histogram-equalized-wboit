@@ -1,6 +1,6 @@
 use crate::camera::Camera;
 use crate::pipeline::alpha_blend::AlphaBlendPipeline;
-use crate::pipeline::histogram_wboit::HistogramWboitPipeline;
+use crate::pipeline::histogram_wboit::{HISTO_FORMAT, HISTO_TEXTURES, HistogramWboitPipeline};
 use crate::pipeline::naive_wboit::NaiveWboitPipeline;
 use crate::pipeline::sliced_oit::{FRONT_FORMAT, SLICE_COUNT, SLICE_FORMAT, SlicedOitPipeline};
 use crate::pipeline::splat::SplatPipelines;
@@ -133,7 +133,8 @@ pub struct Renderer {
     revealage_flag_buffer: wgpu::Buffer,
     naive_revealage_bind_group: wgpu::BindGroup,
 
-    // Histogram WBOIT resources (tiled)
+    // Mode 4's histogram resources (the atomic buffer + 3D CDF volume mode 3 used before
+    // the binning pass replaced them)
     histogram_buffer: wgpu::Buffer,
     cdf_texture_view: wgpu::TextureView,
     cdf_sampler: wgpu::Sampler,
@@ -143,6 +144,14 @@ pub struct Renderer {
     histo_params: HistogramParams,
     tile_size: u32,
     num_bins: u32,
+
+    // Mode 3's rasterized tile histogram (four channel-packed RGBA16F targets at one
+    // pixel per tile) and the double-buffered CDF resolved from it. cdf2d_views[i] is
+    // written on frame i and read on frame 1-i, matching the optical-depth feedback.
+    binning_hist_views: [wgpu::TextureView; HISTO_TEXTURES],
+    cdf2d_views: [[wgpu::TextureView; HISTO_TEXTURES]; 2],
+    binning_params_bind_group: wgpu::BindGroup,
+    hist_read_bind_group: wgpu::BindGroup,
 
     // Bind group layouts (needed for recreation)
     #[allow(dead_code)]
@@ -306,6 +315,8 @@ impl Renderer {
             surface_format,
             &camera_bgl,
             &histogram_wboit.histo_accum_bgl,
+            &histogram_wboit.slice_accum_bgl,
+            &histogram_wboit.binning_params_bgl,
         );
 
         let sliced_oit = SlicedOitPipeline::new(
@@ -313,7 +324,7 @@ impl Renderer {
             surface_format,
             &camera_bgl,
             &object_bgl,
-            &histogram_wboit.histo_accum_bgl,
+            &histogram_wboit.slice_accum_bgl,
         );
 
         // Revealage flag buffer (u32: 0 = use exp approximation, 1 = use revealage)
@@ -401,34 +412,35 @@ impl Renderer {
         });
         queue.write_buffer(&histo_params_buffer, 0, bytemuck::bytes_of(&histo_params));
 
-        // histo_accum_bind_groups[i]: used when frame_index=i, reads prev revealage from [1-i]
+        // Mode 3's rasterized histogram + channel-packed CDF (see binning_common.wgsl).
+        let (binning_hist_views, cdf2d_views) =
+            create_tile_histo_textures(&device, tiles_x, tiles_y);
+
+        let binning_params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("binning params bg"),
+            layout: &histogram_wboit.binning_params_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: histo_params_buffer.as_entire_binding(),
+            }],
+        });
+        let hist_read_bind_group = create_hist_read_bind_group(
+            &device,
+            &histogram_wboit.hist_read_bgl,
+            &binning_hist_views,
+        );
+
+        // histo_accum_bind_groups[i]: used when frame_index=i, reads the CDF resolved on
+        // frame 1-i and the previous frame's optical depth.
         let histo_accum_bind_groups = std::array::from_fn(|i| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("histo accum bg"),
-                layout: &histogram_wboit.histo_accum_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: histogram_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&cdf_texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&cdf_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: histo_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(&optical_depth_views[1 - i]),
-                    },
-                ],
-            })
+            create_histo_accum_bind_group(
+                &device,
+                &histogram_wboit.histo_accum_bgl,
+                &histo_params_buffer,
+                &cdf2d_views[1 - i],
+                &cdf_sampler,
+                &optical_depth_views[1 - i],
+            )
         });
 
         // histo_composite_tex_bind_groups[i]: reads current frame's accum + revealage[i]
@@ -472,7 +484,7 @@ impl Renderer {
             create_front_surface_texture(&device, surface_config.width, surface_config.height);
         let slice_accum_bind_group = create_accum_bind_group(
             &device,
-            &histogram_wboit.histo_accum_bgl,
+            &histogram_wboit.slice_accum_bgl,
             "slice accum bg",
             &histogram_buffer,
             &cdf_texture_view,
@@ -536,6 +548,10 @@ impl Renderer {
             histo_params,
             tile_size,
             num_bins,
+            binning_hist_views,
+            cdf2d_views,
+            binning_params_bind_group,
+            hist_read_bind_group,
             camera_bgl,
             object_bgl,
         }
@@ -1044,40 +1060,31 @@ impl Renderer {
             bytemuck::bytes_of(&self.histo_params),
         );
 
+        let (binning_hist_views, cdf2d_views) =
+            create_tile_histo_textures(&self.device, tiles_x, tiles_y);
+        self.binning_hist_views = binning_hist_views;
+        self.cdf2d_views = cdf2d_views;
+
+        self.hist_read_bind_group = create_hist_read_bind_group(
+            &self.device,
+            &self.histogram_wboit.hist_read_bgl,
+            &self.binning_hist_views,
+        );
+
         self.histo_accum_bind_groups = std::array::from_fn(|i| {
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("histo accum bg"),
-                layout: &self.histogram_wboit.histo_accum_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.histogram_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&self.cdf_texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.cdf_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.histo_params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.optical_depth_views[1 - i],
-                        ),
-                    },
-                ],
-            })
+            create_histo_accum_bind_group(
+                &self.device,
+                &self.histogram_wboit.histo_accum_bgl,
+                &self.histo_params_buffer,
+                &self.cdf2d_views[1 - i],
+                &self.cdf_sampler,
+                &self.optical_depth_views[1 - i],
+            )
         });
 
         self.slice_accum_bind_group = create_accum_bind_group(
             &self.device,
-            &self.histogram_wboit.histo_accum_bgl,
+            &self.histogram_wboit.slice_accum_bgl,
             "slice accum bg",
             &self.histogram_buffer,
             &self.cdf_texture_view,
@@ -1452,22 +1459,9 @@ impl Renderer {
             self.draw_scene(&mut pass, visible, RenderMode::HistogramWboit);
         }
 
-        // Pass 2: CDF build (compute) — one workgroup per tile
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cdf build pass"),
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.histogram_wboit.cdf_build_pipeline);
-            pass.set_bind_group(0, &self.cdf_build_bind_group, &[]);
-            pass.dispatch_workgroups(
-                self.histo_params.tile_count_x,
-                self.histo_params.tile_count_y,
-                1,
-            );
-        }
-
-        // Pass 3: Composite
+        // Pass 2: Composite. Runs before the histogram work on purpose: the binning pass
+        // and CDF resolve only feed NEXT frame's accumulation, so they sit at the tail of
+        // the frame, off the critical path, where a tiler overlaps them with presentation.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("histo composite pass"),
@@ -1488,6 +1482,81 @@ impl Renderer {
             pass.set_bind_group(0, &self.histo_composite_tex_bind_groups[fi], &[]);
             pass.set_bind_group(1, &self.histo_composite_flag_bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+
+        // Pass 3: Binning — the scene rasterized at one pixel per tile, additively
+        // blending optical depth into the 16-channel tile histogram. The clear IS the
+        // histogram clear; on a tiler the whole accumulation lives in tile memory.
+        {
+            let attachments: [Option<wgpu::RenderPassColorAttachment>; HISTO_TEXTURES] =
+                std::array::from_fn(|i| {
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.binning_hist_views[i],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })
+                });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("histo binning pass"),
+                color_attachments: &attachments,
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            self.draw_binning(&mut pass, visible);
+        }
+
+        // Pass 4: CDF resolve — per-tile prefix sum as a fragment shader, reading only
+        // its own pixel of the histogram, into the CDF set the NEXT frame reads.
+        {
+            let attachments: [Option<wgpu::RenderPassColorAttachment>; HISTO_TEXTURES] =
+                std::array::from_fn(|i| {
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.cdf2d_views[fi][i],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            // Every texel is overwritten; Clear keeps the load free on
+                            // tilers.
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })
+                });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("cdf resolve pass"),
+                color_attachments: &attachments,
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.histogram_wboit.cdf_resolve_pipeline);
+            pass.set_bind_group(0, &self.hist_read_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// Issue the binning-pass draws for whichever scene is loaded.
+    fn draw_binning(&self, pass: &mut wgpu::RenderPass<'_>, visible: &[usize]) {
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(2, &self.binning_params_bind_group, &[]);
+
+        if let Some(sp) = &self.splats {
+            pass.set_pipeline(&self.splat_pipelines.binning_pipeline);
+            pass.set_bind_group(1, &sp.bind_group, &[]);
+            pass.draw(0..4, 0..sp.draw_count);
+            return;
+        }
+
+        pass.set_pipeline(&self.histogram_wboit.binning_pipeline);
+        for &idx in visible {
+            let mesh = &self.gpu_meshes[idx];
+            pass.set_bind_group(1, &mesh.object_bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
         }
     }
 
@@ -1786,6 +1855,105 @@ fn create_slice_composite_bind_group(
         entries: &std::array::from_fn::<_, SLICE_COUNT, _>(|i| wgpu::BindGroupEntry {
             binding: i as u32,
             resource: wgpu::BindingResource::TextureView(&views[i]),
+        }),
+    })
+}
+
+/// Mode 3's tile-resolution histogram targets and double-buffered CDF textures. Both are
+/// four channel-packed RGBA16F images at one texel per tile: 16 depth bins across the
+/// channels, WebGPU's default 32-bytes-per-sample MRT budget exactly.
+fn create_tile_histo_textures(
+    device: &wgpu::Device,
+    tiles_x: u32,
+    tiles_y: u32,
+) -> (
+    [wgpu::TextureView; HISTO_TEXTURES],
+    [[wgpu::TextureView; HISTO_TEXTURES]; 2],
+) {
+    let make = |label: String| {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&label),
+            size: wgpu::Extent3d {
+                width: tiles_x,
+                height: tiles_y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HISTO_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        tex.create_view(&wgpu::TextureViewDescriptor::default())
+    };
+
+    let hist = std::array::from_fn(|i| make(format!("binning hist {i}")));
+    // Zero-initialized textures make the first frame's CDF read 0 everywhere, which
+    // degrades that one frame to uniform weights -- the same warm-up the old linear
+    // fallback covered, and the harnesses' priming frames absorb it.
+    let cdf = std::array::from_fn(|set| std::array::from_fn(|i| make(format!("cdf {set}.{i}"))));
+    (hist, cdf)
+}
+
+/// Group 2 of mode 3's accumulation: params, the CDF set resolved last frame, the
+/// filtering sampler, and the previous frame's optical depth.
+fn create_histo_accum_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    histo_params_buffer: &wgpu::Buffer,
+    cdf_views: &[wgpu::TextureView; HISTO_TEXTURES],
+    cdf_sampler: &wgpu::Sampler,
+    prev_optical_depth: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("histo accum bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: histo_params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&cdf_views[0]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&cdf_views[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&cdf_views[2]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&cdf_views[3]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(cdf_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(prev_optical_depth),
+            },
+        ],
+    })
+}
+
+/// Group 0 of the CDF resolve: the four histogram textures it reads at its own pixel.
+fn create_hist_read_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    hist_views: &[wgpu::TextureView; HISTO_TEXTURES],
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hist read bg"),
+        layout,
+        entries: &std::array::from_fn::<_, HISTO_TEXTURES, _>(|i| wgpu::BindGroupEntry {
+            binding: i as u32,
+            resource: wgpu::BindingResource::TextureView(&hist_views[i]),
         }),
     })
 }

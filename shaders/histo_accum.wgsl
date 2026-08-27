@@ -1,19 +1,10 @@
-// common.wgsl is prepended
-
-const OD_SCALE: f32 = 4096.0;
-
-struct HistoParams {
-    tile_count_x: u32,
-    tile_count_y: u32,
-    num_bins: u32,
-    tile_size: u32,
-};
-
-@group(2) @binding(0) var<storage, read_write> histogram: array<atomic<u32>>;
-@group(2) @binding(1) var cdf_texture: texture_3d<f32>;
-@group(2) @binding(2) var cdf_sampler: sampler;
-@group(2) @binding(3) var<uniform> histo_params: HistoParams;
-@group(2) @binding(4) var prev_optical_depth_tex: texture_2d<f32>;
+// common.wgsl and cdf_sample_common.wgsl are prepended.
+//
+// Mode 3 accumulation. Histogram recording moved out of this shader entirely -- the
+// binning pass builds it by rasterization and additive blending (see binning_common.wgsl)
+// -- so this pass is pure attachment blending plus read-only texture sampling again:
+// no storage bindings, no atomics, nothing that disables early-Z or hidden-surface
+// removal on tiled GPUs.
 
 struct WboitOutput {
     @location(0) accum: vec4<f32>,
@@ -41,39 +32,17 @@ fn fs_main(in: VertexOutput) -> WboitOutput {
         1.0,
     );
 
-    let nb = histo_params.num_bins;
-    let bin = min(u32(normalized_z * f32(nb)), nb - 1u);
+    // Quantile of the tile's cumulative optical depth at this fragment's depth, from the
+    // previous frame's binning pass.
+    let equalized_z = sample_cdf(in.clip_position.xy, normalized_z);
 
-    // Tiled atomic: only fragments in this tile compete
-    let ts = histo_params.tile_size;
-    let tile_x = u32(in.clip_position.x) / ts;
-    let tile_y = u32(in.clip_position.y) / ts;
-    let tile_idx = tile_y * histo_params.tile_count_x + tile_x;
-
-    let optical_depth = -log(max(1.0 - alpha, 1e-6));
-    let quantized_od = u32(clamp(optical_depth * OD_SCALE, 0.0, 65535.0));
-    atomicAdd(&histogram[tile_idx * nb + bin], quantized_od);
-
-    // Sample CDF from 3D texture — hardware trilinear gives free spatial + depth interpolation
-    let u = in.clip_position.x / f32(histo_params.tile_count_x * ts);
-    let v = in.clip_position.y / f32(histo_params.tile_count_y * ts);
-    // Texel k holds the exclusive prefix, i.e. tau at the bin's near edge z = k/N, but a
-    // 3D texture samples texel k at (k+0.5)/N. Shifting by half a texel lines the two up,
-    // so linear filtering interpolates between true bin edges: a fragment f of the way
-    // through bin k picks up f of that bin's own optical depth, which is what
-    // transmittance in front of it actually means.
-    let w = normalized_z + 0.5 / f32(nb);
-    let equalized_z = textureSampleLevel(cdf_texture, cdf_sampler, vec3f(u, v, w), 0.0).r;
-
-    // Transmittance in front of this fragment. This used to recover tau by taking the log
-    // of an 8-bit revealage texel and flooring it against a magic constant, because
-    // R8Unorm bottoms out at 1/255 and discarded any tau above 5.54. Now tau is read back
-    // directly, so this is just exp(-tau * CDF(z)) -- nothing clamped, guessed, or lost.
+    // Transmittance in front of this fragment: exp(-tau * CDF(z)), with tau read back
+    // per-pixel from the previous frame's optical-depth target.
     let prev_tau = textureLoad(prev_optical_depth_tex, vec2<i32>(in.clip_position.xy), 0).r;
     let wt = exp(-prev_tau * equalized_z);
 
     var out: WboitOutput;
     out.accum = vec4<f32>(lit.rgb * alpha * wt, alpha * wt);
-    out.optical_depth = optical_depth;
+    out.optical_depth = -log(max(1.0 - alpha, 1e-6));
     return out;
 }
