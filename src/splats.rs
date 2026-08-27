@@ -331,3 +331,22 @@ mod tests {
         assert_eq!(seen, vec![0, 1, 2, 3, 4]);
     }
 }
+
+/// Deterministic full-precision back-to-front order, used to build the reference image
+/// the quality harness scores every other mode against.
+///
+/// The interactive sorter is a quantized 16-bit counting sort; paying the one-time
+/// `O(n log n)` here keeps its quantization out of the measured error.
+pub fn exact_back_to_front_order(
+    positions: &[[f32; 3]],
+    forward: glam::Vec3,
+    count: usize,
+) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..count.min(positions.len()) as u32).collect();
+    order.sort_unstable_by(|&a, &b| {
+        let a = glam::Vec3::from_array(positions[a as usize]).dot(forward);
+        let b = glam::Vec3::from_array(positions[b as usize]).dot(forward);
+        b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order
+}

@@ -2,6 +2,7 @@ use crate::camera::Camera;
 use crate::pipeline::alpha_blend::AlphaBlendPipeline;
 use crate::pipeline::histogram_wboit::HistogramWboitPipeline;
 use crate::pipeline::naive_wboit::NaiveWboitPipeline;
+use crate::pipeline::sliced_oit::{FRONT_FORMAT, SLICE_COUNT, SLICE_FORMAT, SlicedOitPipeline};
 use crate::pipeline::splat::SplatPipelines;
 use crate::scene::Scene;
 use crate::splats::SplatScene;
@@ -30,6 +31,7 @@ pub enum RenderMode {
     AlphaBlend = 1,
     NaiveWboit = 2,
     HistogramWboit = 3,
+    SlicedOit = 4,
 }
 
 impl RenderMode {
@@ -38,8 +40,17 @@ impl RenderMode {
             RenderMode::AlphaBlend => "Alpha Blend",
             RenderMode::NaiveWboit => "Naive WBOIT",
             RenderMode::HistogramWboit => "Histogram-Equalized WBOIT (tiled)",
+            RenderMode::SlicedOit => "Quantile-Sliced OIT (4 slabs)",
         }
     }
+
+    /// Every mode, in menu order.
+    pub const ALL: [RenderMode; 4] = [
+        RenderMode::AlphaBlend,
+        RenderMode::NaiveWboit,
+        RenderMode::HistogramWboit,
+        RenderMode::SlicedOit,
+    ];
 }
 
 /// GPU-resident splat scene plus the knobs the UI can turn.
@@ -92,6 +103,7 @@ pub struct Renderer {
     alpha_blend: AlphaBlendPipeline,
     naive_wboit: NaiveWboitPipeline,
     histogram_wboit: HistogramWboitPipeline,
+    sliced_oit: SlicedOitPipeline,
     splat_pipelines: SplatPipelines,
 
     /// Present only when a PLY was supplied on the command line; when it is, splats
@@ -102,6 +114,14 @@ pub struct Renderer {
     accum_texture_view: wgpu::TextureView,
     optical_depth_views: [wgpu::TextureView; 2],
     frame_index: usize,
+
+    // Mode 4's ordered slabs, and the composite bind group that reads all of them.
+    slice_views: [wgpu::TextureView; SLICE_COUNT],
+    sliced_composite_bind_group: wgpu::BindGroup,
+    // The front-surface prepass target, and mode 4's accumulation bind group: the same
+    // layout mode 3 uses, with the previous frame's optical depth swapped for this.
+    front_surface_view: wgpu::TextureView,
+    slice_accum_bind_group: wgpu::BindGroup,
 
     // Double-buffered bind groups indexed by frame_index:
     // [i] renders to optical_depth_views[i], reads prev from optical_depth_views[1-i]
@@ -288,6 +308,14 @@ impl Renderer {
             &histogram_wboit.histo_accum_bgl,
         );
 
+        let sliced_oit = SlicedOitPipeline::new(
+            &device,
+            surface_format,
+            &camera_bgl,
+            &object_bgl,
+            &histogram_wboit.histo_accum_bgl,
+        );
+
         // Revealage flag buffer (u32: 0 = use exp approximation, 1 = use revealage)
         let revealage_flag_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("revealage flag buffer"),
@@ -440,6 +468,24 @@ impl Renderer {
             ],
         });
 
+        let front_surface_view =
+            create_front_surface_texture(&device, surface_config.width, surface_config.height);
+        let slice_accum_bind_group = create_accum_bind_group(
+            &device,
+            &histogram_wboit.histo_accum_bgl,
+            "slice accum bg",
+            &histogram_buffer,
+            &cdf_texture_view,
+            &cdf_sampler,
+            &histo_params_buffer,
+            &front_surface_view,
+        );
+
+        let slice_views =
+            create_slice_textures(&device, surface_config.width, surface_config.height);
+        let sliced_composite_bind_group =
+            create_slice_composite_bind_group(&device, &sliced_oit.composite_bgl, &slice_views);
+
         let histo_composite_flag_bind_group =
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("histo composite flag bg"),
@@ -466,11 +512,16 @@ impl Renderer {
             alpha_blend,
             naive_wboit,
             histogram_wboit,
+            sliced_oit,
             splat_pipelines,
             splats: None,
             accum_texture_view,
             optical_depth_views,
             frame_index: 0,
+            slice_views,
+            sliced_composite_bind_group,
+            front_surface_view,
+            slice_accum_bind_group,
             wboit_composite_bind_groups,
             histo_accum_bind_groups,
             histo_composite_tex_bind_groups,
@@ -572,17 +623,14 @@ impl Renderer {
         });
     }
 
-    /// Read the offscreen target back and write it out as a PNG. Headless only -- a
-    /// swapchain image is not guaranteed to be copyable.
-    ///
-    /// Returns the un-premultiplied RGBA the file was written with. The target is an sRGB
-    /// format holding premultiplied alpha, so pixels are divided through by alpha to get
-    /// straight alpha, which is what PNG viewers expect.
-    pub fn capture_png(&self, path: &std::path::Path) -> Result<(), String> {
+    /// Read the offscreen target back into tightly-packed bytes, in the surface format's
+    /// own channel order and encoding. Headless only -- a swapchain image is not
+    /// guaranteed to be copyable.
+    fn read_offscreen(&self) -> Result<Vec<u8>, String> {
         let texture = self
             .offscreen
             .as_ref()
-            .ok_or("capture_png requires a headless renderer")?;
+            .ok_or("offscreen readback requires a headless renderer")?;
         let (width, height) = (self.surface_config.width, self.surface_config.height);
 
         // Buffer rows must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT.
@@ -638,26 +686,76 @@ impl Renderer {
             .map_err(|e| format!("buffer map failed: {e:?}"))?;
 
         let mapped = slice.get_mapped_range();
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        let mut bytes = Vec::with_capacity((width * height * 4) as usize);
         for row in 0..height {
             let start = (row * padded) as usize;
-            let row_bytes = &mapped[start..start + unpadded as usize];
-            for px in row_bytes.chunks_exact(4) {
-                let a = px[3];
-                if a == 0 || a == 255 {
-                    pixels.extend_from_slice(px);
-                } else {
-                    // Un-premultiply into straight alpha for the file.
-                    let f = 255.0 / a as f32;
-                    pixels.push((px[0] as f32 * f).min(255.0) as u8);
-                    pixels.push((px[1] as f32 * f).min(255.0) as u8);
-                    pixels.push((px[2] as f32 * f).min(255.0) as u8);
-                    pixels.push(a);
-                }
-            }
+            bytes.extend_from_slice(&mapped[start..start + unpadded as usize]);
         }
         drop(mapped);
         buffer.unmap();
+        Ok(bytes)
+    }
+
+    /// Read the offscreen target back as linear premultiplied RGBA, which is the space
+    /// the quality harness measures error in.
+    ///
+    /// The target holds premultiplied alpha in an sRGB format, so decoding sRGB gives
+    /// `color * alpha` in linear light directly -- no un-premultiply, which would divide
+    /// by a near-zero alpha on the many almost-empty pixels of a splat scene and turn
+    /// quantization noise into huge errors.
+    pub fn capture_linear_rgba(&self) -> Result<Vec<[f32; 4]>, String> {
+        let bytes = self.read_offscreen()?;
+        let format = self.surface_config.format;
+        let bgra = matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let srgb = format.is_srgb();
+        let decode = |value: u8| {
+            let value = value as f32 / 255.0;
+            if !srgb {
+                value
+            } else if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|px| {
+                let (r, g, b) = if bgra {
+                    (px[2], px[1], px[0])
+                } else {
+                    (px[0], px[1], px[2])
+                };
+                [decode(r), decode(g), decode(b), px[3] as f32 / 255.0]
+            })
+            .collect())
+    }
+
+    /// Read the offscreen target back and write it out as a PNG. Headless only.
+    ///
+    /// The file gets un-premultiplied RGBA: the target is an sRGB format holding
+    /// premultiplied alpha, so pixels are divided through by alpha to get the straight
+    /// alpha PNG viewers expect.
+    pub fn capture_png(&self, path: &std::path::Path) -> Result<(), String> {
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+        let bytes = self.read_offscreen()?;
+        let mut pixels = Vec::with_capacity(bytes.len());
+        for px in bytes.chunks_exact(4) {
+            let a = px[3];
+            if a == 0 || a == 255 {
+                pixels.extend_from_slice(px);
+            } else {
+                // Un-premultiply into straight alpha for the file.
+                let f = 255.0 / a as f32;
+                pixels.push((px[0] as f32 * f).min(255.0) as u8);
+                pixels.push((px[1] as f32 * f).min(255.0) as u8);
+                pixels.push((px[2] as f32 * f).min(255.0) as u8);
+                pixels.push(a);
+            }
+        }
 
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -730,6 +828,38 @@ impl Renderer {
         }
     }
 
+    /// Group 2 for the modes that have one. Modes 3 and 4 share its layout and differ only
+    /// in what binding 4 holds -- see `shaders/slice_common.wgsl`.
+    fn accum_bind_group(&self, mode: RenderMode) -> Option<&wgpu::BindGroup> {
+        match mode {
+            RenderMode::HistogramWboit => Some(&self.histo_accum_bind_groups[self.frame_index]),
+            RenderMode::SlicedOit => Some(&self.slice_accum_bind_group),
+            _ => None,
+        }
+    }
+
+    /// Draw the front-surface prepass: the nearest solid fragment at each pixel, which is
+    /// the per-pixel occlusion evidence the tile CDF cannot supply.
+    fn draw_front_surface(&self, pass: &mut wgpu::RenderPass<'_>, visible: &[usize]) {
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+
+        if let Some(sp) = &self.splats {
+            pass.set_pipeline(&self.splat_pipelines.front_pipeline);
+            pass.set_bind_group(1, &sp.bind_group, &[]);
+            pass.draw(0..4, 0..sp.draw_count);
+            return;
+        }
+
+        pass.set_pipeline(&self.sliced_oit.front_pipeline);
+        for &idx in visible {
+            let mesh = &self.gpu_meshes[idx];
+            pass.set_bind_group(1, &mesh.object_bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+        }
+    }
+
     /// Issue the draws for whichever scene is loaded.
     fn draw_scene(&self, pass: &mut wgpu::RenderPass<'_>, visible: &[usize], mode: RenderMode) {
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -739,11 +869,12 @@ impl Renderer {
                 RenderMode::AlphaBlend => &self.splat_pipelines.alpha_pipeline,
                 RenderMode::NaiveWboit => &self.splat_pipelines.wboit_pipeline,
                 RenderMode::HistogramWboit => &self.splat_pipelines.histo_pipeline,
+                RenderMode::SlicedOit => &self.splat_pipelines.sliced_pipeline,
             };
             pass.set_pipeline(pipeline);
             pass.set_bind_group(1, &sp.bind_group, &[]);
-            if mode == RenderMode::HistogramWboit {
-                pass.set_bind_group(2, &self.histo_accum_bind_groups[self.frame_index], &[]);
+            if let Some(bg) = self.accum_bind_group(mode) {
+                pass.set_bind_group(2, bg, &[]);
             }
             // One instanced quad per splat, expanded to the projected 3-sigma extent.
             pass.draw(0..4, 0..sp.draw_count);
@@ -754,10 +885,11 @@ impl Renderer {
             RenderMode::AlphaBlend => &self.alpha_blend.pipeline,
             RenderMode::NaiveWboit => &self.naive_wboit.accum_pipeline,
             RenderMode::HistogramWboit => &self.histogram_wboit.accum_pipeline,
+            RenderMode::SlicedOit => &self.sliced_oit.accum_pipeline,
         };
         pass.set_pipeline(pipeline);
-        if mode == RenderMode::HistogramWboit {
-            pass.set_bind_group(2, &self.histo_accum_bind_groups[self.frame_index], &[]);
+        if let Some(bg) = self.accum_bind_group(mode) {
+            pass.set_bind_group(2, bg, &[]);
         }
 
         for &idx in visible {
@@ -833,6 +965,14 @@ impl Renderer {
         let (accum_view, optical_depth_views) = create_wboit_textures(&self.device, width, height);
         self.accum_texture_view = accum_view;
         self.optical_depth_views = optical_depth_views;
+
+        self.front_surface_view = create_front_surface_texture(&self.device, width, height);
+        self.slice_views = create_slice_textures(&self.device, width, height);
+        self.sliced_composite_bind_group = create_slice_composite_bind_group(
+            &self.device,
+            &self.sliced_oit.composite_bgl,
+            &self.slice_views,
+        );
 
         // Recreate double-buffered bind groups
         self.wboit_composite_bind_groups = std::array::from_fn(|i| {
@@ -934,6 +1074,17 @@ impl Renderer {
                 ],
             })
         });
+
+        self.slice_accum_bind_group = create_accum_bind_group(
+            &self.device,
+            &self.histogram_wboit.histo_accum_bgl,
+            "slice accum bg",
+            &self.histogram_buffer,
+            &self.cdf_texture_view,
+            &self.cdf_sampler,
+            &self.histo_params_buffer,
+            &self.front_surface_view,
+        );
 
         self.cdf_build_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cdf build bg"),
@@ -1138,6 +1289,9 @@ impl Renderer {
             RenderMode::HistogramWboit => {
                 self.render_histogram_wboit(&mut encoder, &view, &visible);
             }
+            RenderMode::SlicedOit => {
+                self.render_sliced_oit(&mut encoder, &view, &visible);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -1336,6 +1490,118 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
     }
+
+    /// Mode 4. Structurally mode 3 with a different pass 1 and pass 3: the CDF build in
+    /// between is byte-for-byte the same compute dispatch.
+    fn render_sliced_oit(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        visible: &[usize],
+    ) {
+        // Pass 0: front-surface prepass. Depth-tested, so it resolves the nearest solid
+        // fragment per pixel without sorting anything.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("front surface prepass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.front_surface_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Depth 1 in the alpha channel: no front surface here.
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        // The accumulation pass clears depth again and never tests it.
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            self.draw_front_surface(&mut pass, visible);
+        }
+
+        // Pass 1: scatter into the ordered slabs, recording the histogram on the way.
+        {
+            let color_attachments: [Option<wgpu::RenderPassColorAttachment<'_>>; SLICE_COUNT] =
+                std::array::from_fn(|i| {
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.slice_views[i],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })
+                });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sliced accum pass"),
+                color_attachments: &color_attachments,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            self.draw_scene(&mut pass, visible, RenderMode::SlicedOit);
+        }
+
+        // Pass 2: CDF build, for the next frame's slab assignment.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("sliced cdf build pass"),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.histogram_wboit.cdf_build_pipeline);
+            pass.set_bind_group(0, &self.cdf_build_bind_group, &[]);
+            pass.dispatch_workgroups(
+                self.histo_params.tile_count_x,
+                self.histo_params.tile_count_y,
+                1,
+            );
+        }
+
+        // Pass 3: resolve each slab, then blend the four in order.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sliced composite pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+
+            pass.set_pipeline(&self.sliced_oit.composite_pipeline);
+            pass.set_bind_group(0, &self.sliced_composite_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
 }
 
 /// Offscreen colour target used in place of a swapchain image when headless.
@@ -1417,6 +1683,111 @@ fn create_wboit_textures(
         accum.create_view(&wgpu::TextureViewDescriptor::default()),
         optical_depth_views,
     )
+}
+
+/// Mode 4's ordered slabs. Same format and usage as the accum target: rendered into with
+/// additive blending, then read back by the composite.
+fn create_slice_textures(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> [wgpu::TextureView; SLICE_COUNT] {
+    std::array::from_fn(|i| {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("slice texture {i}")),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SLICE_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        tex.create_view(&wgpu::TextureViewDescriptor::default())
+    })
+}
+
+/// Group 2 for modes 3 and 4. Binding 4 is the only thing that differs between them: mode
+/// 3 reads the previous frame's optical depth there, mode 4 this frame's front surface.
+fn create_accum_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    label: &str,
+    histogram_buffer: &wgpu::Buffer,
+    cdf_texture_view: &wgpu::TextureView,
+    cdf_sampler: &wgpu::Sampler,
+    histo_params_buffer: &wgpu::Buffer,
+    binding4: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: histogram_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(cdf_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(cdf_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: histo_params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(binding4),
+            },
+        ],
+    })
+}
+
+/// Mode 4's front-surface prepass target.
+fn create_front_surface_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> wgpu::TextureView {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("front surface texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FRONT_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Bind all four slabs for the composite pass.
+fn create_slice_composite_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    views: &[wgpu::TextureView; SLICE_COUNT],
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sliced composite bind group"),
+        layout,
+        entries: &std::array::from_fn::<_, SLICE_COUNT, _>(|i| wgpu::BindGroupEntry {
+            binding: i as u32,
+            resource: wgpu::BindingResource::TextureView(&views[i]),
+        }),
+    })
 }
 
 fn create_cdf_texture(

@@ -36,11 +36,7 @@ impl Default for BenchConfig {
         Self {
             warmup: 60,
             frames: 300,
-            modes: vec![
-                RenderMode::AlphaBlend,
-                RenderMode::NaiveWboit,
-                RenderMode::HistogramWboit,
-            ],
+            modes: RenderMode::ALL.to_vec(),
             distance_scale: 1.15,
             tile_size: None,
             bins: None,

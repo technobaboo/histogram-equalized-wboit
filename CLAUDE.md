@@ -2,14 +2,37 @@
 
 ## Context
 
-Comparing three transparency rendering techniques side-by-side in a wgpu demo. The demo
+Comparing four transparency rendering techniques side-by-side in a wgpu demo. The demo
 renders either a built-in quad/mesh scene or a **3D Gaussian Splatting** scene loaded from a
-PLY file (see *3DGS Mode* below), through the same three techniques:
-1. **Regular alpha blending** (baseline with ordering artifacts)
+PLY file (see *3DGS Mode* below), through the same four techniques:
+1. **Regular alpha blending** (baseline with ordering artifacts; with an exact per-view
+   sort it is also the ground truth the quality harness scores everything else against)
 2. **Naive WBOIT** (McGuire & Bavoil 2013 - static depth-based weight function)
-3. **Histogram-equalized WBOIT** (novel technique - uses a global depth histogram from the previous frame to build a CDF, which remaps depth values so WBOIT weights spread across the full f32 exponential range)
+3. **Histogram-equalized WBOIT** (uses a tiled depth histogram from the previous frame to
+   build a CDF, which remaps depth so WBOIT weights spread across the full f16 exponential
+   range)
+4. **Quantile-sliced OIT** (uses the same CDF as an *ordering key* rather than a weight:
+   fragments are scattered into four ordered optical-depth slabs, corrected by a per-pixel
+   front-surface prepass, and the slabs are composited in order)
 
-The goal is to show that adaptive weight redistribution via histogram equalization significantly improves WBOIT quality when fragments cluster at similar depths.
+The goal is to show that adaptive weight redistribution via histogram equalization
+significantly improves WBOIT quality when fragments cluster at similar depths -- and, in
+mode 4, that the same histogram is worth considerably more as an ordering key than as a
+weight.
+
+Measured on `splats/rem_v3_clear.ply` (129k splats, 8px tiles, 64 bins). Loss is
+foreground MSE against the sorted reference from `--quality 16 --size 960x540`; cost is
+median frame time from `--headless --frames 200 --size 1280x720`:
+
+| mode | fg MSE | PSNR | median ms |
+|---|---|---|---|
+| 2 naive WBOIT | 8.2e-3 | 20.9 dB | 1.5 |
+| 3 histogram-equalized | 1.0e-3 | 30.0 dB | 6.0 |
+| 4 quantile-sliced | 5.1e-4 | 32.9 dB | 8.6 |
+
+Both numbers depend on the view set and the camera distance, so compare within a run, not
+across runs -- the tables further down are all from `--quality 8 --size 640x360` and are
+internally consistent with each other but not with this one.
 
 ## Project Setup
 
@@ -50,6 +73,8 @@ wboit-demo/
 ├── splats/                     # Test 3DGS PLY files (not tracked)
 ├── src/
 │   ├── main.rs                 # DONE - env_logger init, optional PLY argument, winit event loop
+│   ├── bench.rs                # DONE - cost harness: pinned camera, GPU fence, headless
+│   ├── quality.rs              # DONE - loss harness: random views vs. an exactly sorted reference
 │   ├── app.rs                  # DONE - ApplicationHandler, keyboard/mouse/scroll input, redraw loop
 │   ├── renderer.rs             # DONE - GPU state, 3 render paths, resize, buffer management
 │   ├── camera.rs               # DONE - Orbit camera (spherical coords, mouse drag, scroll zoom)
@@ -63,7 +88,8 @@ wboit-demo/
 │       ├── alpha_blend.rs      # DONE - Mode 1 pipeline (SrcAlpha/OneMinusSrcAlpha blend)
 │       ├── naive_wboit.rs      # DONE - Mode 2 accum pipeline (MRT) + composite pipeline
 │       ├── histogram_wboit.rs  # DONE - Mode 3 accum + compute CDF + composite pipelines
-│       └── splat.rs            # DONE - 3DGS variants of all three accumulation pipelines
+│       ├── sliced_oit.rs       # DONE - Mode 4 front prepass + slab accum + ordered composite
+│       └── splat.rs            # DONE - 3DGS variants of all four accumulation pipelines
 └── shaders/
     ├── common.wgsl             # DONE - Camera/Object/VertexInput/VertexOutput structs, basic_vertex, simple_lighting
     ├── alpha_blend.wgsl        # DONE - vs_main/fs_main calling basic_vertex + simple_lighting
@@ -193,6 +219,85 @@ Single pass:
 - Bind groups: accum texture, optical-depth texture, flag uniform
 - Same composite math as Mode 2: read accum + optical depth, output blended color
 
+### Mode 4: Quantile-Sliced OIT (4 passes)
+> Pipelines: `src/pipeline/sliced_oit.rs` (`front_pipeline` + `accum_pipeline` + `composite_pipeline`),
+> plus `SplatPipelines::{front_pipeline, sliced_pipeline}` for the splat variants
+> Shaders: `shaders/front_surface.wgsl` / `splat_front_surface.wgsl` (prepass),
+> `shaders/slice_common.wgsl` + `sliced_accum.wgsl` / `splat_sliced.wgsl` (accum),
+> `shaders/sliced_composite.wgsl`
+> Render path: `src/renderer.rs` `render_sliced_oit()`
+
+Mode 3 uses the tile CDF as a **weight**, which is only as good as the assumption that the
+tile's normalized depth profile matches the pixel's -- the tile-dilution failure documented
+below. Mode 4 uses the same CDF as an **ordering key**, which is a far weaker assumption:
+diluting the CDF rescales the quantile axis but leaves it *monotone*, so fragments keep
+their relative order and only slab boundaries drift. It reuses mode 3's histogram buffer,
+CDF volume, compute pass and bind group layout unchanged.
+
+**Pass 0 - Front-surface prepass:**
+- Color target: `Rgba16Float`, `(color.rgb, normalized_z)`, cleared to `(0,0,0,1)`
+- Depth: the shared depth texture, **write enabled, compare Less** -- the only pipeline in
+  the demo that does a real depth test, because it is resolving the *nearest* qualifying
+  fragment per pixel
+- Fragments below `FRONT_CORE_ALPHA` (0.15) are discarded: the faint outer support of a
+  Gaussian is not a surface, and anchoring to it would demote everything genuinely behind it
+
+**Pass 1 - Slab accumulation (4x MRT):**
+- Four `Rgba16Float` targets, additive `One + One`
+- Same histogram `atomicAdd` and CDF sample as mode 3, giving `quantile = CDF_tile(z)`
+- `front_occlusion()` then corrects that quantile against the prepass (see below)
+- `slice_scatter()` places the fragment at `quantile * 3` along the four slabs, split
+  between the two it falls between, carrying `(color * tau, tau)`
+
+**Pass 2 - CDF build:** byte-for-byte the same compute dispatch as mode 3's pass 2.
+
+**Pass 3 - Ordered composite:** each slab resolves to `1 - exp(-tau)` with a
+tau-weighted average colour, then the four are alpha-composited front to back.
+
+### Why mode 4 works, and which half of it does the work
+> `shaders/slice_common.wgsl` `front_occlusion()`
+
+The slicing on its own is worth almost nothing. Measured on the splat scene at 8px tiles,
+slicing without the front-surface correction scores about what mode 3 scores; the entire
+gain comes from `front_occlusion()`. The ablation, foreground MSE, lower is better:
+
+| variant | fg MSE |
+|---|---|
+| slicing alone (no prepass) | ~1.7e-3 (i.e. mode 3) |
+| + front anchor only | 2.8e-3 |
+| + depth-gated demotion, no colour term | 1.6e-3 |
+| + demotion with the colour term | 6.4e-4 |
+
+What the correction does is narrow: a fragment clearly *behind* this pixel's nearest solid
+surface, and visibly different in colour from it, has its quantile pushed to 1 -- into the
+last slab, where everything in front occludes it. That is exactly the repair tile dilution
+needs, because tile dilution's error is always toward *under*-occlusion, and the prepass is
+per-pixel where the CDF is per-tile.
+
+The colour term is what keeps it from over-correcting. A fragment just behind the front
+surface that looks like it is almost certainly part of that same surface seen a fraction
+deeper; demoting it would hollow the surface out. Dropping the colour term costs 2.5x.
+
+A pixel with no front surface reads back `front.w == 1`, so `behind` is 0 and the whole
+mechanism is inert -- which is the state of the entire background, for free.
+
+**Ordering key beats weight at every tile size, and degrades far more gracefully.** Mode 4
+at 32px tiles is better than mode 3 at 4px tiles while using 1/64th the CDF memory:
+
+| tile | mode 3 fg MSE | mode 4 fg MSE |
+|---|---|---|
+| 32 px | 4.2e-3 | 8.5e-4 |
+| 16 px | 2.9e-3 | 7.4e-4 |
+| 8 px | 1.8e-3 | 6.4e-4 |
+| 4 px | 1.0e-3 | 5.8e-4 |
+
+Mode 3 improves 4.1x across that range, mode 4 only 1.5x -- the signature of the axis
+having moved off the spatial resolution of the CDF.
+
+**Cost.** The slab MRT is nearly free; the prepass is not. At 1280x720, 129k splats,
+median ms: mode 3 = 6.0, mode 4 without the prepass = 6.3 (+5%), mode 4 with it = 8.6
+(+43%). The extra geometry pass is the whole cost, and it buys 2.8x on loss.
+
 ### Histogram Buffer Layout
 > Created in `src/renderer.rs` `new()` and recreated in `resize()`
 
@@ -264,8 +369,11 @@ Single pass:
   matches sorted alpha blending.
 
   Note that **more depth bins does not help** -- the bins refine the depth axis, but this
-  error lives on the spatial axis. Only smaller tiles (or a per-pixel CDF, which is far too
-  much memory) address it. Cost at 1080p, histogram + CDF volume: 32px = 1.6 MB,
+  error lives on the spatial axis. Within mode 3, only smaller tiles (or a per-pixel CDF,
+  which is far too much memory) address it. Mode 4 addresses it a different way, by
+  demoting the CDF from a weight to an ordering key and repairing what is left with a
+  per-pixel front-surface prepass -- which is why its tile-size curve is nearly flat where
+  mode 3's is steep. Cost at 1080p, histogram + CDF volume: 32px = 1.6 MB,
   8px = 25 MB, 4px = 100 MB. The CDF volume must stay `Rgba16Float` even though only `.r` is
   used, because `r32float` is not filterable in core WebGPU without `float32-filterable`, and
   the trilinear sample is load-bearing.
@@ -305,6 +413,28 @@ Single pass:
   - *magnitude* -- how much total optical depth a pixel can express. Was the tightest of
     the three while revealage lived in R8Unorm; resolved by storing `tau` in R16Float, per
     the note above.
+- **Premultiplied alpha and sRGB do not commute** -- this is why partially transparent
+  pixels composite too bright against the desktop. The surface negotiates
+  `Bgra8UnormSrgb` + `CompositeAlphaMode::PreMultiplied` (logged at startup). With an sRGB
+  format the GPU blends in linear space and applies the linear->sRGB encode *on write*, so
+  the composite shader's `vec4(avg_color * alpha, alpha)` lands in memory as
+  `srgb(color * alpha)`. But the near-universal convention for premultiplied 8-bit sRGB
+  buffers -- Wayland's ARGB8888, Cairo, Skia -- is that premultiplication applies to the
+  *encoded* value, `srgb(color) * alpha`, and compositors blend those encoded values
+  directly.
+
+  Since sRGB encoding is nonlinear, `srgb(c*a) != srgb(c)*a`. The two agree exactly at
+  `alpha = 0` and `alpha = 1` and diverge worst in between, which is the signature of the
+  artefact: opaque geometry looks right, translucent geometry looks washed out. For white
+  at `alpha = 0.2` we write 124/255 where the compositor expects 51/255 -- **73/255 too
+  bright**. Alpha itself is never sRGB-encoded, so only RGB is affected.
+
+  `W` sidesteps it by clearing the swapchain opaque, forcing every pixel to `alpha = 1`
+  where the two conventions coincide. A real fix would either encode manually into a
+  non-sRGB surface (`vec4(linear_to_srgb(avg_color) * alpha, alpha)` into `Bgra8Unorm`,
+  which also moves mode 1's blending into gamma space) or pre-compensate into the sRGB
+  surface (`srgb_to_linear(linear_to_srgb(avg_color) * alpha)`, which keeps linear blending
+  at the cost of a round trip).
 - **Atomics in fragment shaders**: `atomicAdd` on `var<storage, read_write>` IS allowed in fragment shaders per WGSL spec. The underlying Vulkan feature `fragmentStoresAndAtomics` is widely supported on desktop.
 - **CDF build via compute shader**: A single workgroup of 256 threads performs a parallel Hillis-Steele inclusive prefix sum, normalizes, writes CDF, and clears the histogram. Dispatched as `(1,1,1)` between the accum and composite render passes.
 - **First frame**: CDF buffer initialized to linear fallback values `(1/256, 2/256, ..., 256/256)` with total optical depth = `257/256` on creation (`src/renderer.rs` `new()`). Histogram starts zeroed.
@@ -385,14 +515,86 @@ a depth-stencil state, because they draw into the same render passes as the mesh
 ### Sorting (mode 1 only)
 > `src/splats.rs`
 
-Modes 2 and 3 are order-independent by construction and draw in whatever order the buffer
-holds. Mode 1 needs a real back-to-front sort every frame, which is done as a **16-bit
+Modes 2, 3 and 4 are order-independent by construction and draw in whatever order the
+buffer holds. Mode 1 needs a real back-to-front sort every frame, which is done as a **16-bit
 counting sort on a background thread**: view-space depth is quantized to `u16`, so the sort
 is a single O(n) counting pass with no comparisons. Measured at ~6 ms for 921k splats.
 
 The render thread never blocks on it — it keeps drawing the previous frame's order until a
 new one arrives, and only one request is ever in flight (the worker drops stale requests and
 sorts the newest camera). At orbit speeds the one-frame lag is not visible.
+
+## Benchmarking
+
+Two harnesses, measuring different things. Neither substitutes for the other: a technique
+can be cheap and wrong, or accurate and unaffordable, and the whole point of mode 4 is that
+it trades one for the other.
+
+```
+cargo run --release -- splats/rem_v3_clear.ply --headless --frames 200 \
+    --screenshot out/shot.png                     # cost
+cargo run --release -- splats/rem_v3_clear.ply --quality 16   # loss
+scripts/sweep.sh splats/rem_v3_clear.ply out/     # both, over modes + tiles + bins
+```
+
+### Cost: `--bench` / `--headless`
+> Implemented in `src/bench.rs`; CLI in `src/main.rs`; capture in `Renderer::capture_png`
+
+Interactive frame times cannot be compared: vsync clamps them to the refresh rate, and any
+camera movement changes splat overdraw by an order of magnitude. `--bench` pins the camera,
+ignores all input and disables vsync; `--headless` goes further and skips winit entirely,
+rendering into an offscreen texture and timing a GPU fence (`Renderer::wait_for_gpu`) so it
+measures execution rather than submission.
+
+**Prefer `--headless` for anything you intend to compare.** Measured on the same machine
+and scene, the windowed path varied by ~2x between back-to-back runs (GPU clock ramp plus
+compositor scheduling) while headless reproduces to under 1%.
+
+Flags: `--mode N`, `--frames N`, `--warmup N`, `--dist F` (camera distance as a multiple of
+scene radius -- the main overdraw control), `--tile N`, `--bins N`, `--size WxH`,
+`--screenshot PATH`. `--screenshot` implies `--headless`, because a swapchain image is not
+guaranteed to be copyable. With more than one mode, `.modeN` is inserted before the
+extension so a single invocation yields one PNG per mode.
+
+Captured PNGs are un-premultiplied on the way out (the render target holds premultiplied
+alpha) and tagged sRGB, so they can be eyeballed against each other. For a *number* rather
+than an eyeball, use the quality harness below.
+
+### Loss: `--quality N`
+> Implemented in `src/quality.rs`; readback in `Renderer::capture_linear_rgba`;
+> reference ordering in `splats::exact_back_to_front_order`
+
+Scores every mode against a ground truth over `N` camera poses drawn from a seeded
+SplitMix64 stream, so a run reproduces exactly from its seed and two builds see identical
+poses. The reference is **mode 1 driven by a full-precision per-view back-to-front sort**
+-- not the interactive 16-bit counting sort, so its quantization stays out of the measured
+error.
+
+Flags: `--quality N`, `--seed N`, plus `--mode`, `--tile`, `--bins`, `--size`, `--dist`.
+Always headless. Default distance is 2.8x scene radius rather than the cost harness's
+1.15x, so the whole scene stays inside the frustum at every orientation and no view is
+scored on clipped geometry.
+
+Error is measured in **linear premultiplied RGBA**: premultiplied because that is what the
+target holds and un-premultiplying divides by a near-zero alpha over most of a splat frame;
+linear because sRGB-space error over-weights dark pixels at these magnitudes. Three
+numbers come out:
+
+- **foreground MSE** over pixels either image gives alpha > 1/255, and its PSNR. The
+  headline: a large empty background cannot dilute it.
+- **full-frame MSE**, where silhouette spill outside the subject shows up.
+- **high-frequency residual**, the mean squared *gradient* of the luma error field. Plain
+  MSE cannot tell a uniform tint from the same energy scattered as per-pixel grain, and
+  grain is the failure mode of stochastic and quantized techniques. This is what caught
+  mode 4's hard-snap variant being worse in two ways at once.
+
+Every candidate is rendered `PRIMING_FRAMES` extra times at its pose before the frame that
+is scored, because modes 2, 3 and 4 all consume one-frame-old state; without that the score
+would partly reflect the *previous* view's camera.
+
+This harness came from `MalekiRe/tiled_gpu_gaussian_splatting`, rewritten onto the headless
+path. Its numbers agree with the original's to five significant figures on the same scene,
+which is a useful check that neither reimplemented the metric wrong.
 
 ## Scene
 > Implemented in `src/scene.rs` (scene setup + auto-rotation) and `src/mesh.rs` (geometry generators)
@@ -403,13 +605,15 @@ sorts the newest camera). At orbit speeds the one-frame lag is not visible.
   - `glam::Mat4::perspective_rh()` for projection
   - `glam::Mat4::look_at_rh()` for view
   - Spherical coords: `eye = target + distance * vec3(cos(pitch)*sin(yaw), sin(pitch), cos(pitch)*cos(yaw))`
-- **Background**: Dark gray (0.1, 0.1, 0.1) clear color (set in each render pass in `src/renderer.rs`)
+- **Background**: Dark gray (0.1, 0.1, 0.1) opaque clear, or transparent with `W` (`Renderer::clear_color`)
 
 ## Controls
 > Implemented in `src/app.rs` `window_event()` handler
 
-- `1` / `2` / `3`: Switch rendering mode (sets `renderer.mode`)
+- `1` / `2` / `3` / `4`: Switch rendering mode (sets `renderer.mode`)
 - `M`: Toggle mesh visibility (toggles `scene.show_meshes`)
+- `W`: Toggle the window background between opaque dark grey and transparent. Opaque is
+  the default and shows true colours; see the premultiplied-sRGB note above for why.
 - `A`: Toggle exact alpha (`1 - exp(-tau)`) vs. the `1 - exp(-accum.a)` approximation
 - `C`: (3DGS only) Cycle the render cap: 100% / 50% / 25% / 10% of the scene
 - `[` / `]`: (3DGS only) Shrink / grow splats, for dialling overdraw up and down
@@ -436,6 +640,8 @@ sorts the newest camera). At orbit speeds the one-frame lag is not visible.
 7. **Mode 2** - DONE: `src/pipeline/naive_wboit.rs` + `shaders/wboit_accum.wgsl` + `shaders/wboit_composite.wgsl`
 8. **Mode 3** - DONE: `src/pipeline/histogram_wboit.rs` + `shaders/histo_accum.wgsl` + `shaders/histo_composite.wgsl`
 9. **Polish** - DONE: Input handling in `app.rs`, resize in `renderer.rs` `resize()`, mode switching, console output
+10. **Harnesses** - DONE: `src/bench.rs` (cost), `src/quality.rs` (loss), `scripts/sweep.sh`
+11. **Mode 4** - DONE: `src/pipeline/sliced_oit.rs` + `shaders/{front_common,front_surface,splat_front_surface,slice_common,sliced_accum,splat_sliced,sliced_composite}.wgsl`
 
 ## Verification
 
@@ -444,6 +650,8 @@ sorts the newest camera). At orbit speeds the one-frame lag is not visible.
 3. Press `1` - alpha blending with visible ordering artifacts
 4. Press `2` - WBOIT (order-independent but static weights)
 5. Press `3` - histogram-equalized WBOIT (global, better layer separation at clustered depths)
-6. Press `M` - toggle meshes on/off
-7. Mouse drag to orbit, verify all modes render correctly from different angles
-8. Resize window - no crashes, all textures/buffers recreated
+6. Press `4` - quantile-sliced OIT (visibly the closest to mode 1 on a splat scene)
+7. Press `M` - toggle meshes on/off
+8. Mouse drag to orbit, verify all modes render correctly from different angles
+9. Resize window - no crashes, all textures/buffers recreated
+10. `--quality 16` on a splat scene ranks the modes 4 < 3 < 2 by foreground MSE

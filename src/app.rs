@@ -193,6 +193,10 @@ impl ApplicationHandler for App {
                                 renderer.mode = RenderMode::HistogramWboit;
                                 println!("Mode: {}", renderer.mode.name());
                             }
+                            "4" => {
+                                renderer.mode = RenderMode::SlicedOit;
+                                println!("Mode: {}", renderer.mode.name());
+                            }
                             "a" | "A" => {
                                 renderer.use_revealage = !renderer.use_revealage;
                                 println!(

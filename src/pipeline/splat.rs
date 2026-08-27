@@ -7,8 +7,10 @@
 
 pub struct SplatPipelines {
     pub alpha_pipeline: wgpu::RenderPipeline,
+    pub front_pipeline: wgpu::RenderPipeline,
     pub wboit_pipeline: wgpu::RenderPipeline,
     pub histo_pipeline: wgpu::RenderPipeline,
+    pub sliced_pipeline: wgpu::RenderPipeline,
     pub splat_bgl: wgpu::BindGroupLayout,
 }
 
@@ -27,6 +29,38 @@ fn shader(device: &wgpu::Device, label: &str, body: &str) -> wgpu::ShaderModule 
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", common, body).into()),
+    })
+}
+
+/// Mode 4 needs the slice helpers between the splat prelude and its own body.
+fn sliced_shader(device: &wgpu::Device) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("splat sliced shader"),
+        source: wgpu::ShaderSource::Wgsl(
+            format!(
+                "{}\n{}\n{}\n{}",
+                include_str!("../../shaders/splat_common.wgsl"),
+                include_str!("../../shaders/front_common.wgsl"),
+                include_str!("../../shaders/slice_common.wgsl"),
+                include_str!("../../shaders/splat_sliced.wgsl"),
+            )
+            .into(),
+        ),
+    })
+}
+
+fn splat_front_shader(device: &wgpu::Device) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("splat front surface shader"),
+        source: wgpu::ShaderSource::Wgsl(
+            format!(
+                "{}\n{}\n{}",
+                include_str!("../../shaders/splat_common.wgsl"),
+                include_str!("../../shaders/front_common.wgsl"),
+                include_str!("../../shaders/splat_front_surface.wgsl"),
+            )
+            .into(),
+        ),
     })
 }
 
@@ -222,10 +256,74 @@ impl SplatPipelines {
             cache: None,
         });
 
+        // Mode 4: same accumulation bind groups as mode 3, four slabs instead of an
+        // accum/optical-depth pair.
+        let sliced_shader = sliced_shader(device);
+        let sliced_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("splat sliced layout"),
+            bind_group_layouts: &[camera_bgl, &splat_bgl, histo_accum_bgl],
+            immediate_size: 0,
+        });
+        let slice_targets = crate::pipeline::sliced_oit::slice_targets();
+        let sliced_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("splat sliced pipeline"),
+            layout: Some(&sliced_layout),
+            vertex: wgpu::VertexState {
+                module: &sliced_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sliced_shader,
+                entry_point: Some("fs_main"),
+                targets: &slice_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: Some(depth_state()),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Mode 4 prepass. The only splat pipeline with depth writes on: it is resolving
+        // the nearest solid splat per pixel, which is what a depth test is for.
+        let front_shader = splat_front_shader(device);
+        let front_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("splat front surface layout"),
+            bind_group_layouts: &[camera_bgl, &splat_bgl],
+            immediate_size: 0,
+        });
+        let front_targets = crate::pipeline::sliced_oit::front_target();
+        let front_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("splat front surface pipeline"),
+            layout: Some(&front_layout),
+            vertex: wgpu::VertexState {
+                module: &front_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &front_shader,
+                entry_point: Some("fs_main"),
+                targets: &front_targets,
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: Some(crate::pipeline::sliced_oit::front_depth_state()),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             alpha_pipeline,
+            front_pipeline,
             wboit_pipeline,
             histo_pipeline,
+            sliced_pipeline,
             splat_bgl,
         }
     }
