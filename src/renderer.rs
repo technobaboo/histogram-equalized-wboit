@@ -92,6 +92,9 @@ pub struct Renderer {
     /// agree only at alpha 0 and 1 -- so forcing the whole frame to alpha 1 sidesteps the
     /// mismatch entirely and shows true colours.
     pub opaque_background: bool,
+    /// Draw the built-in quad/mesh scene on top of a loaded splat scene. No effect
+    /// without a PLY (the mesh scene is already the only thing being drawn).
+    pub mesh_overlay: bool,
 
     // Shared resources
     camera_buffer: wgpu::Buffer,
@@ -517,6 +520,7 @@ impl Renderer {
             mode: RenderMode::AlphaBlend,
             use_revealage: true,
             opaque_background: true,
+            mesh_overlay: false,
             camera_buffer,
             camera_bind_group,
             depth_texture_view,
@@ -863,9 +867,14 @@ impl Renderer {
             pass.set_pipeline(&self.splat_pipelines.front_pipeline);
             pass.set_bind_group(1, &sp.bind_group, &[]);
             pass.draw(0..4, 0..sp.draw_count);
+        }
+
+        if visible.is_empty() {
             return;
         }
 
+        // Switching to the mesh layout invalidates group 1 upward, so rebind from 0.
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_pipeline(&self.sliced_oit.front_pipeline);
         for &idx in visible {
             let mesh = &self.gpu_meshes[idx];
@@ -894,9 +903,13 @@ impl Renderer {
             }
             // One instanced quad per splat, expanded to the projected 3-sigma extent.
             pass.draw(0..4, 0..sp.draw_count);
+        }
+
+        if visible.is_empty() {
             return;
         }
 
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
         let pipeline = match mode {
             RenderMode::AlphaBlend => &self.alpha_blend.pipeline,
             RenderMode::NaiveWboit => &self.naive_wboit.accum_pipeline,
@@ -1209,7 +1222,7 @@ impl Renderer {
         }
 
         // Update object transforms (mesh scene only)
-        let mut visible: Vec<usize> = if self.splats.is_some() {
+        let mut visible: Vec<usize> = if self.splats.is_some() && !self.mesh_overlay {
             Vec::new()
         } else {
             scene
@@ -1547,9 +1560,14 @@ impl Renderer {
             pass.set_pipeline(&self.splat_pipelines.binning_pipeline);
             pass.set_bind_group(1, &sp.bind_group, &[]);
             pass.draw(0..4, 0..sp.draw_count);
+        }
+
+        if visible.is_empty() {
             return;
         }
 
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(2, &self.binning_params_bind_group, &[]);
         pass.set_pipeline(&self.histogram_wboit.binning_pipeline);
         for &idx in visible {
             let mesh = &self.gpu_meshes[idx];

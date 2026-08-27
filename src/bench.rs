@@ -21,6 +21,8 @@ pub struct BenchConfig {
     /// of the viewport, which is the dominant control on splat overdraw.
     pub distance_scale: f32,
     pub tile_size: Option<u32>,
+    /// Draw the built-in mesh scene alongside a loaded splat scene.
+    pub mesh_overlay: bool,
     pub bins: Option<u32>,
     /// Render without a window and exit; required for `screenshot`.
     pub headless: bool,
@@ -39,6 +41,7 @@ impl Default for BenchConfig {
             modes: RenderMode::ALL.to_vec(),
             distance_scale: 1.15,
             tile_size: None,
+            mesh_overlay: false,
             bins: None,
             headless: false,
             screenshot: None,
@@ -199,6 +202,7 @@ pub fn run_headless(
     let mut renderer = Renderer::new(None, (config.width, config.height), false);
     let scene = Scene::new();
     renderer.upload_scene(&scene);
+    renderer.mesh_overlay = config.mesh_overlay;
 
     let mut camera = Camera::new(config.width as f32 / config.height as f32);
     camera.viewport = (config.width as f32, config.height as f32);

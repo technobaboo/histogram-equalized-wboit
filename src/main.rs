@@ -36,6 +36,8 @@ usage: wboit-demo [PLY] [options]
   --warmup N          discarded frames per mode (default 60)
   --dist F            camera distance as a multiple of scene radius (default 1.15 in
                       bench, 2.8 in quality, 2.5 interactive). Lower = more overdraw.
+  --meshes            draw the built-in quad/mesh scene together with the loaded PLY
+                      (same as pressing G interactively; no effect without a PLY)
   --tile N            histogram tile size in pixels (32/16/8/4)
   --bins N            histogram depth bins (32/64/128/256)
   -h, --help          show this
@@ -48,6 +50,7 @@ struct Args {
     distance_scale: Option<f32>,
     tile_size: Option<u32>,
     bins: Option<u32>,
+    mesh_overlay: bool,
 }
 
 fn parse_args() -> Args {
@@ -62,6 +65,7 @@ fn parse_args() -> Args {
     let mut tile_size = None;
     let mut bins = None;
     let mut headless = false;
+    let mut mesh_overlay = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -83,6 +87,7 @@ fn parse_args() -> Args {
             "--quality" => quality_views = value(&mut i).parse::<u32>().ok().or(Some(16)),
             "--seed" => seed = value(&mut i).parse().unwrap_or(seed),
             "--headless" => headless = true,
+            "--meshes" => mesh_overlay = true,
             "--screenshot" => cfg.screenshot = Some(PathBuf::from(value(&mut i))),
             "--size" => {
                 let v = value(&mut i);
@@ -123,6 +128,7 @@ fn parse_args() -> Args {
     }
     cfg.tile_size = tile_size;
     cfg.bins = bins;
+    cfg.mesh_overlay = mesh_overlay;
     // A screenshot needs a copyable target, which only the offscreen path guarantees.
     cfg.headless = headless || cfg.screenshot.is_some();
 
@@ -135,6 +141,7 @@ fn parse_args() -> Args {
             bins,
             width: cfg.width,
             height: cfg.height,
+            mesh_overlay,
             ..Default::default()
         };
         if let Some(d) = distance_scale {
@@ -151,6 +158,7 @@ fn parse_args() -> Args {
         distance_scale,
         tile_size,
         bins,
+        mesh_overlay,
     }
 }
 
@@ -214,6 +222,7 @@ fn main() {
         args.distance_scale,
         args.tile_size,
         args.bins,
+        args.mesh_overlay,
     );
     event_loop.run_app(&mut app).unwrap();
 }

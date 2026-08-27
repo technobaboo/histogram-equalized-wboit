@@ -30,6 +30,8 @@ pub struct QualityConfig {
     /// Modes to score. Mode 1 is always the reference and is skipped if listed.
     pub modes: Vec<RenderMode>,
     pub tile_size: Option<u32>,
+    /// Draw the built-in mesh scene alongside a loaded splat scene.
+    pub mesh_overlay: bool,
     pub bins: Option<u32>,
     /// Camera distance as a multiple of scene radius; each view jitters up from here.
     pub distance_scale: f32,
@@ -44,6 +46,7 @@ impl Default for QualityConfig {
             seed: 1,
             modes: RenderMode::ALL.to_vec(),
             tile_size: None,
+            mesh_overlay: false,
             bins: None,
             // Far enough out that the whole scene stays inside the frustum at every
             // orientation, so no view is scored on clipped geometry.
@@ -80,6 +83,7 @@ pub fn run(config: QualityConfig, splats: Option<SplatScene>) -> Result<(), Stri
     let mut renderer = Renderer::new(None, (config.width, config.height), false);
     let scene = Scene::new();
     renderer.upload_scene(&scene);
+    renderer.mesh_overlay = config.mesh_overlay;
     // Alpha has to survive to the readback for the foreground mask to mean anything, so
     // the frame is composited over a transparent clear rather than the opaque grey.
     renderer.opaque_background = false;

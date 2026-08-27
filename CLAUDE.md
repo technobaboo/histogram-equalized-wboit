@@ -610,7 +610,8 @@ measures execution rather than submission.
 and scene, the windowed path varied by ~2x between back-to-back runs (GPU clock ramp plus
 compositor scheduling) while headless reproduces to under 1%.
 
-Flags: `--mode N`, `--frames N`, `--warmup N`, `--dist F` (camera distance as a multiple of
+Flags: `--meshes` (draw the built-in quad scene alongside the PLY, the `G` toggle),
+`--mode N`, `--frames N`, `--warmup N`, `--dist F` (camera distance as a multiple of
 scene radius -- the main overdraw control), `--tile N`, `--bins N`, `--size WxH`,
 `--screenshot PATH`. `--screenshot` implies `--headless`, because a swapchain image is not
 guaranteed to be copyable. With more than one mode, `.modeN` is inserted before the
@@ -630,7 +631,8 @@ poses. The reference is **mode 1 driven by a full-precision per-view back-to-fro
 -- not the interactive 16-bit counting sort, so its quantization stays out of the measured
 error.
 
-Flags: `--quality N`, `--seed N`, plus `--mode`, `--tile`, `--bins`, `--size`, `--dist`.
+Flags: `--quality N`, `--seed N`, plus `--mode`, `--tile`, `--bins`, `--size`, `--dist`,
+`--meshes`.
 Always headless. Default distance is 2.8x scene radius rather than the cost harness's
 1.15x, so the whole scene stays inside the frustum at every orientation and no view is
 scored on clipped geometry.
@@ -672,6 +674,11 @@ which is a useful check that neither reimplemented the metric wrong.
 
 - `1` / `2` / `3` / `4`: Switch rendering mode (sets `renderer.mode`)
 - `M`: Toggle mesh visibility (toggles `scene.show_meshes`)
+- `G`: (3DGS only) Toggle the built-in quad/mesh scene as an overlay drawn *together* with
+  the splats (`renderer.mesh_overlay`). Both scenes go through the same passes, so all four
+  modes composite them jointly; mode 1 has no cross-scene ordering, so quads and splats
+  interleave wrongly there. The mesh scene sits at the origin with radius ~6, which is not
+  scaled to the loaded splat scene.
 - `W`: Toggle the window background between opaque dark grey and transparent. Opaque is
   the default and shows true colours; see the premultiplied-sRGB note above for why.
 - `A`: Toggle exact alpha (`1 - exp(-tau)`) vs. the `1 - exp(-accum.a)` approximation

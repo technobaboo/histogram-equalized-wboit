@@ -33,6 +33,7 @@ pub struct App {
     distance_scale: Option<f32>,
     tile_size: Option<u32>,
     bins: Option<u32>,
+    mesh_overlay: bool,
 }
 
 /// Render-cap steps cycled with `C`, as a fraction of the loaded scene.
@@ -45,6 +46,7 @@ impl App {
         distance_scale: Option<f32>,
         tile_size: Option<u32>,
         bins: Option<u32>,
+        mesh_overlay: bool,
     ) -> Self {
         let sorter = splats
             .as_ref()
@@ -66,6 +68,7 @@ impl App {
             distance_scale,
             tile_size,
             bins,
+            mesh_overlay,
         }
     }
 
@@ -116,6 +119,8 @@ impl ApplicationHandler for App {
         self.window = Some(window);
 
         if let Some(renderer) = &mut self.renderer {
+            renderer.mesh_overlay = self.mesh_overlay
+                || self.bench.as_ref().is_some_and(|b| b.config.mesh_overlay);
             if let Some(t) = self
                 .tile_size
                 .or_else(|| self.bench.as_ref().and_then(|b| b.config.tile_size))
@@ -218,6 +223,14 @@ impl ApplicationHandler for App {
                                 println!(
                                     "Meshes: {}",
                                     if self.scene.show_meshes { "ON" } else { "OFF" }
+                                );
+                            }
+                            "g" | "G" if renderer.has_splats() => {
+                                renderer.mesh_overlay = !renderer.mesh_overlay;
+                                println!(
+                                    "Mesh overlay: {} (built-in quad scene drawn together \
+with the splats)",
+                                    if renderer.mesh_overlay { "ON" } else { "OFF" }
                                 );
                             }
                             "w" | "W" => {
