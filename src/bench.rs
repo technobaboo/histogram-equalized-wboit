@@ -226,6 +226,19 @@ pub fn run_headless(
         }
     }
 
+    // Mode 1 is only meaningful -- and is only the quality harness's reference -- when the
+    // splats are actually sorted. The camera is pinned for the whole run, so one exact
+    // back-to-front sort here covers every frame; keeping it out of the timing loop also
+    // keeps the reported cost comparable to the other modes, none of which sort.
+    if let Some(splats) = &splats {
+        let order = crate::splats::exact_back_to_front_order(
+            &splats.positions,
+            camera.forward(),
+            renderer.splat_draw_count(),
+        );
+        renderer.upload_splat_order(&order);
+    }
+
     let mut bench = Bench::new(config);
     let total = bench.config.warmup + bench.config.frames;
 

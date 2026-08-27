@@ -580,6 +580,13 @@ buffer holds. Mode 1 needs a real back-to-front sort every frame, which is done 
 counting sort on a background thread**: view-space depth is quantized to `u16`, so the sort
 is a single O(n) counting pass with no comparisons. Measured at ~6 ms for 921k splats.
 
+The headless harnesses do not use that thread: `--quality` sorts exactly per view (that is
+what makes mode 1 its reference), and `--headless` sorts once with
+`exact_back_to_front_order` before the frame loop, since its camera is pinned. Without that
+the bench's mode 1 screenshot composited in importance order and came out glassy /
+see-through, which is what the mode 1 PNG from `scripts/sweep.sh` used to show. The sort sits
+outside the timing loop, so mode 1's reported cost still excludes it, as it always did.
+
 The render thread never blocks on it — it keeps drawing the previous frame's order until a
 new one arrives, and only one request is ever in flight (the worker drops stale requests and
 sorts the newest camera). At orbit speeds the one-frame lag is not visible.
