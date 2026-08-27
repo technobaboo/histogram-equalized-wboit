@@ -54,9 +54,9 @@ impl ApplicationHandler for App {
         }
 
         let title = if self.splats.is_some() {
-            "3DGS WBOIT Demo - 1/2/3 modes, A revealage, C cap, [ ] splat size, R reset"
+            "3DGS WBOIT Demo - 1/2/3 modes, A revealage, T tile, C cap, [ ] splat size, R reset"
         } else {
-            "WBOIT Demo - Press 1/2/3 to switch modes, A to toggle revealage, M to toggle meshes"
+            "WBOIT Demo - 1/2/3 modes, A revealage, T histogram tile, M meshes"
         };
         let attrs = Window::default_attributes()
             .with_title(title)
@@ -138,6 +138,13 @@ impl ApplicationHandler for App {
                                 println!(
                                     "Meshes: {}",
                                     if self.scene.show_meshes { "ON" } else { "OFF" }
+                                );
+                            }
+                            "t" | "T" => {
+                                let (tile, mb) = renderer.cycle_tile_size();
+                                println!(
+                                    "Histogram tile: {tile}x{tile} px ({mb:.1} MB) \
+- smaller tiles = less background bleed-through in mode 3"
                                 );
                             }
                             "c" | "C" if renderer.has_splats() => {

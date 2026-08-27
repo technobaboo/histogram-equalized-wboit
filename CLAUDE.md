@@ -239,6 +239,36 @@ Single pass:
   `1 - prod(1 - a_i)`, the composite `avg_color * (1 - revealage)` reduces algebraically to
   the exact front-to-back integral. Mode 3's error is therefore entirely in how well the
   binned, tiled, one-frame-late CDF approximates the true `tau(z)`.
+- **Tile size is the dominant quality knob in mode 3** (`TILE_SIZE_STEPS`, cycled with `T`,
+  default 8px). The weight applied is `w_i = prev_R ^ CDF_tile(z_i)`, i.e.
+  `exp(-tau_pixel * CDF_tile(z_i))`, but the correct transmittance is `exp(-tau_pixel(z_i))`.
+  Those agree **only if** `CDF_tile(z) == tau_pixel(z) / tau_pixel` -- that is, only if the
+  tile's *normalized* depth profile matches the pixel's. The magnitude of optical depth is
+  per-pixel and correct (it comes from the revealage texture); only its **distribution in
+  depth** is borrowed from the tile.
+
+  The failure is directional: always toward **under-occlusion**. Any pixel in the tile that
+  sees the background *without* the foreground adds optical depth to the far bins while
+  adding none to the near bins, flattening the CDF's front-loading -- which is precisely the
+  quantity that produces occlusion. Worked example: a pixel sees an arm (tau=5) at z1 then a
+  sign (tau=5) at z2, so tau_pixel=10. Truth is `w_arm : w_sign = 1 : e^-5`, a ratio of 148.
+  If the tile holds only pixels like this one, `CDF_tile(z2) = 0.5` and the model reproduces
+  148 exactly. If half the tile's pixels see the sign but not the arm, `CDF_tile(z2)` falls
+  to 0.333, the ratio collapses to 28, and the sign bleeds through the arm.
+
+  This is why the technique looks near-perfect on the quad scene and washed out on splats:
+  six big flat quads means every pixel in a tile sees the same quads at the same depths, so
+  `CDF_tile ~= CDF_pixel`. A detailed 3DGS figure has depth complexity varying pixel to
+  pixel, and at 32px granularity almost every tile straddles a silhouette, so the dilution is
+  global rather than confined to edges. Measured: 32px ghosts badly, 8px is nearly clean, 4px
+  matches sorted alpha blending.
+
+  Note that **more depth bins does not help** -- the bins refine the depth axis, but this
+  error lives on the spatial axis. Only smaller tiles (or a per-pixel CDF, which is far too
+  much memory) address it. Cost at 1080p, histogram + CDF volume: 32px = 1.6 MB,
+  8px = 25 MB, 4px = 100 MB. The CDF volume must stay `Rgba16Float` even though only `.r` is
+  used, because `r32float` is not filterable in core WebGPU without `float32-filterable`, and
+  the trilinear sample is load-bearing.
 - **Atomics in fragment shaders**: `atomicAdd` on `var<storage, read_write>` IS allowed in fragment shaders per WGSL spec. The underlying Vulkan feature `fragmentStoresAndAtomics` is widely supported on desktop.
 - **CDF build via compute shader**: A single workgroup of 256 threads performs a parallel Hillis-Steele inclusive prefix sum, normalizes, writes CDF, and clears the histogram. Dispatched as `(1,1,1)` between the accum and composite render passes.
 - **First frame**: CDF buffer initialized to linear fallback values `(1/256, 2/256, ..., 256/256)` with total optical depth = `257/256` on creation (`src/renderer.rs` `new()`). Histogram starts zeroed.
@@ -347,6 +377,9 @@ sorts the newest camera). At orbit speeds the one-frame lag is not visible.
 - `A`: Toggle revealage vs. the `exp(-accum.a)` approximation
 - `C`: (3DGS only) Cycle the render cap: 100% / 50% / 25% / 10% of the scene
 - `[` / `]`: (3DGS only) Shrink / grow splats, for dialling overdraw up and down
+- `T`: Cycle the histogram tile size (32/16/8/4 px). The single biggest quality knob for
+  mode 3 -- see *Tile size is the dominant quality knob* above. Sizes that would exceed the
+  device's storage-binding limit are skipped.
 - `R`: Reset the camera to its framing of the loaded scene
 - `Escape`: Exit
 - Mouse drag (left button): Orbit camera (`camera.on_mouse_move`)

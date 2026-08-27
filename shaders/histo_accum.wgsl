@@ -1,6 +1,5 @@
 // common.wgsl is prepended
 
-const TILE_SIZE: u32 = 32u;
 const OD_SCALE: f32 = 4096.0;
 
 struct HistoParams {
@@ -43,8 +42,9 @@ fn fs_main(in: VertexOutput) -> WboitOutput {
     let bin = min(u32(normalized_z * f32(nb)), nb - 1u);
 
     // Tiled atomic: only fragments in this tile compete
-    let tile_x = u32(in.clip_position.x) / TILE_SIZE;
-    let tile_y = u32(in.clip_position.y) / TILE_SIZE;
+    let ts = histo_params.tile_size;
+    let tile_x = u32(in.clip_position.x) / ts;
+    let tile_y = u32(in.clip_position.y) / ts;
     let tile_idx = tile_y * histo_params.tile_count_x + tile_x;
 
     let optical_depth = -log(max(1.0 - alpha, 1e-6));
@@ -52,8 +52,8 @@ fn fs_main(in: VertexOutput) -> WboitOutput {
     atomicAdd(&histogram[tile_idx * nb + bin], quantized_od);
 
     // Sample CDF from 3D texture — hardware trilinear gives free spatial + depth interpolation
-    let u = in.clip_position.x / f32(histo_params.tile_count_x * TILE_SIZE);
-    let v = in.clip_position.y / f32(histo_params.tile_count_y * TILE_SIZE);
+    let u = in.clip_position.x / f32(histo_params.tile_count_x * ts);
+    let v = in.clip_position.y / f32(histo_params.tile_count_y * ts);
     // Texel k holds the exclusive prefix, i.e. tau at the bin's near edge z = k/N, but a
     // 3D texture samples texel k at (k+0.5)/N. Shifting by half a texel lines the two up,
     // so linear filtering interpolates between true bin edges: a fragment f of the way

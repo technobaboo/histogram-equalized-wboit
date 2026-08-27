@@ -8,7 +8,15 @@ use crate::splats::SplatScene;
 use crate::vertex::{CameraUniform, HistogramParams, ObjectUniform, SplatParams};
 
 const NUM_DEPTH_BINS: u32 = 64;
-const TILE_SIZE: u32 = 32;
+/// Screen-space tile edge, in pixels, for the depth histogram. Cycled at runtime with `T`.
+///
+/// This is the single most important quality knob in mode 3. The CDF is per-tile but the
+/// transmittance it modulates is per-pixel, so a tile is only a valid stand-in for its
+/// pixels when they share a depth profile. Large tiles straddling a silhouette mix pixels
+/// that see the background *without* the foreground into the same CDF, which flattens its
+/// front-loading and under-occludes -- background bleeding through solid surfaces.
+const TILE_SIZE_STEPS: [u32; 4] = [32, 16, 8, 4];
+const DEFAULT_TILE_SIZE: u32 = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RenderMode {
@@ -95,6 +103,7 @@ pub struct Renderer {
     cdf_build_bind_group: wgpu::BindGroup,
     histo_composite_flag_bind_group: wgpu::BindGroup,
     histo_params: HistogramParams,
+    tile_size: u32,
 
     // Bind group layouts (needed for recreation)
     #[allow(dead_code)]
@@ -268,14 +277,15 @@ impl Renderer {
         });
 
         // Tiled histogram resources
-        let tiles_x = (surface_config.width + TILE_SIZE - 1) / TILE_SIZE;
-        let tiles_y = (surface_config.height + TILE_SIZE - 1) / TILE_SIZE;
+        let tile_size = DEFAULT_TILE_SIZE;
+        let tiles_x = surface_config.width.div_ceil(tile_size);
+        let tiles_y = surface_config.height.div_ceil(tile_size);
 
         let histo_params = HistogramParams {
             tile_count_x: tiles_x,
             tile_count_y: tiles_y,
             num_bins: NUM_DEPTH_BINS,
-            tile_size: TILE_SIZE,
+            tile_size,
         };
 
         let histogram_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -416,6 +426,7 @@ impl Renderer {
             cdf_build_bind_group,
             histo_composite_flag_bind_group,
             histo_params,
+            tile_size,
             camera_bgl,
             object_bgl,
         }
@@ -653,15 +664,38 @@ impl Renderer {
             })
         });
 
-        // Recreate tiled histogram resources
-        let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
-        let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
+        self.histo_composite_tex_bind_groups = std::array::from_fn(|i| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("histo composite tex bg"),
+                layout: &self.histogram_wboit.histo_composite_tex_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.accum_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.revealage_views[i]),
+                    },
+                ],
+            })
+        });
+
+        self.rebuild_tiled_histogram();
+    }
+
+    /// (Re)create everything that depends on the tile grid: the histogram buffer, the CDF
+    /// volume, and the bind groups pointing at them. Called on resize and whenever the
+    /// tile size changes.
+    fn rebuild_tiled_histogram(&mut self) {
+        let tiles_x = self.surface_config.width.div_ceil(self.tile_size);
+        let tiles_y = self.surface_config.height.div_ceil(self.tile_size);
 
         self.histo_params = HistogramParams {
             tile_count_x: tiles_x,
             tile_count_y: tiles_y,
             num_bins: NUM_DEPTH_BINS,
-            tile_size: TILE_SIZE,
+            tile_size: self.tile_size,
         };
 
         self.histogram_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -711,23 +745,6 @@ impl Renderer {
             })
         });
 
-        self.histo_composite_tex_bind_groups = std::array::from_fn(|i| {
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("histo composite tex bg"),
-                layout: &self.histogram_wboit.histo_composite_tex_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.accum_texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&self.revealage_views[i]),
-                    },
-                ],
-            })
-        });
-
         self.cdf_build_bind_group =
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("cdf build bg"),
@@ -747,6 +764,36 @@ impl Renderer {
                     },
                 ],
             });
+    }
+
+    /// Step to the next tile size and rebuild. Sizes whose histogram would exceed the
+    /// device's storage-binding limit are skipped rather than crashing the demo.
+    /// Returns the new tile size and the total tiled-histogram footprint in MB.
+    pub fn cycle_tile_size(&mut self) -> (u32, f64) {
+        let limit = self.device.limits().max_storage_buffer_binding_size as u64;
+        let cur = TILE_SIZE_STEPS
+            .iter()
+            .position(|&t| t == self.tile_size)
+            .unwrap_or(0);
+        for step in 1..=TILE_SIZE_STEPS.len() {
+            let candidate = TILE_SIZE_STEPS[(cur + step) % TILE_SIZE_STEPS.len()];
+            if self.tiled_bytes(candidate).0 <= limit {
+                self.tile_size = candidate;
+                break;
+            }
+        }
+        self.rebuild_tiled_histogram();
+        let (hist, cdf) = self.tiled_bytes(self.tile_size);
+        (self.tile_size, (hist + cdf) as f64 / 1.0e6)
+    }
+
+    /// Bytes used by the histogram buffer and the CDF volume at a given tile size.
+    fn tiled_bytes(&self, tile_size: u32) -> (u64, u64) {
+        let tiles = self.surface_config.width.div_ceil(tile_size) as u64
+            * self.surface_config.height.div_ceil(tile_size) as u64;
+        let bins = NUM_DEPTH_BINS as u64;
+        // Histogram is one u32 per bin; the CDF volume is Rgba16Float, so 8 bytes.
+        (tiles * bins * 4, tiles * bins * 8)
     }
 
     pub fn render(&mut self, camera: &Camera, scene: &Scene) {

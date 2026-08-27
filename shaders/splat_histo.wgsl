@@ -3,7 +3,6 @@
 // fragment's optical depth into the tile's depth histogram, and weight it by the
 // transmittance implied by the previous frame's CDF.
 
-const TILE_SIZE: u32 = 32u;
 const OD_SCALE: f32 = 4096.0;
 
 struct HistoParams {
@@ -49,8 +48,9 @@ fn fs_main(in: SplatVsOut) -> WboitOutput {
     let nb = histo_params.num_bins;
     let bin = min(u32(normalized_z * f32(nb)), nb - 1u);
 
-    let tile_x = u32(in.clip_position.x) / TILE_SIZE;
-    let tile_y = u32(in.clip_position.y) / TILE_SIZE;
+    let ts = histo_params.tile_size;
+    let tile_x = u32(in.clip_position.x) / ts;
+    let tile_y = u32(in.clip_position.y) / ts;
     let tile_idx = tile_y * histo_params.tile_count_x + tile_x;
 
     let optical_depth = -log(max(1.0 - alpha, 1e-6));
@@ -58,8 +58,8 @@ fn fs_main(in: SplatVsOut) -> WboitOutput {
     atomicAdd(&histogram[tile_idx * nb + bin], quantized_od);
 
     // Trilinear sampling of the CDF volume gives spatial and depth interpolation for free.
-    let u = in.clip_position.x / f32(histo_params.tile_count_x * TILE_SIZE);
-    let v = in.clip_position.y / f32(histo_params.tile_count_y * TILE_SIZE);
+    let u = in.clip_position.x / f32(histo_params.tile_count_x * ts);
+    let v = in.clip_position.y / f32(histo_params.tile_count_y * ts);
     // Half-texel shift: texel k holds the exclusive prefix at bin edge z = k/N. See
     // histo_accum.wgsl for the full reasoning.
     let w = normalized_z + 0.5 / f32(nb);
