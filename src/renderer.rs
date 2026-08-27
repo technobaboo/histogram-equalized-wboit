@@ -66,7 +66,10 @@ struct GpuMesh {
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    pub surface: wgpu::Surface<'static>,
+    /// `None` when running headless: there is no window, so we render into `offscreen`
+    /// and read that back instead of presenting.
+    pub surface: Option<wgpu::Surface<'static>>,
+    offscreen: Option<wgpu::Texture>,
     pub surface_config: wgpu::SurfaceConfiguration,
     pub mode: RenderMode,
     pub use_revealage: bool,
@@ -128,18 +131,24 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(window: std::sync::Arc<winit::window::Window>) -> Self {
-        let size = window.inner_size();
+    /// `window` of `None` runs headless: no surface, no presentation, rendering into an
+    /// offscreen texture that `capture_png` can read back.
+    pub fn new(
+        window: Option<std::sync::Arc<winit::window::Window>>,
+        size: (u32, u32),
+        vsync: bool,
+    ) -> Self {
+        let size = winit::dpi::PhysicalSize::new(size.0.max(1), size.1.max(1));
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
 
-        let surface = instance.create_surface(window).unwrap();
+        let surface = window.map(|w| instance.create_surface(w).unwrap());
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
+            compatible_surface: surface.as_ref(),
             force_fallback_adapter: false,
         }))
         .expect("Failed to find adapter");
@@ -158,32 +167,46 @@ impl Renderer {
         }))
         .expect("Failed to create device");
 
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(surface_caps.formats[0]);
+        // Headless still renders through the same sRGB path as the window, so the two
+        // are directly comparable; Rgba8 just makes readback a straight byte copy.
+        let surface_caps = surface.as_ref().map(|s| s.get_capabilities(&adapter));
+        let surface_format = match &surface_caps {
+            Some(caps) => caps
+                .formats
+                .iter()
+                .find(|f| f.is_srgb())
+                .copied()
+                .unwrap_or(caps.formats[0]),
+            None => wgpu::TextureFormat::Rgba8UnormSrgb,
+        };
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: if surface_caps
-                .alpha_modes
-                .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-            {
-                wgpu::CompositeAlphaMode::PreMultiplied
-            } else if surface_caps
-                .alpha_modes
-                .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
-            {
-                wgpu::CompositeAlphaMode::PostMultiplied
+            present_mode: if vsync {
+                wgpu::PresentMode::AutoVsync
             } else {
-                surface_caps.alpha_modes[0]
+                wgpu::PresentMode::AutoNoVsync
+            },
+            alpha_mode: match &surface_caps {
+                Some(caps)
+                    if caps
+                        .alpha_modes
+                        .contains(&wgpu::CompositeAlphaMode::PreMultiplied) =>
+                {
+                    wgpu::CompositeAlphaMode::PreMultiplied
+                }
+                Some(caps)
+                    if caps
+                        .alpha_modes
+                        .contains(&wgpu::CompositeAlphaMode::PostMultiplied) =>
+                {
+                    wgpu::CompositeAlphaMode::PostMultiplied
+                }
+                Some(caps) => caps.alpha_modes[0],
+                None => wgpu::CompositeAlphaMode::Auto,
             },
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -192,12 +215,18 @@ impl Renderer {
         // and the alpha mode decides what the compositor thinks the alpha means. Both
         // change how the window blends against the desktop.
         println!(
-            "Surface: {:?} (srgb: {}), alpha mode: {:?}",
+            "Target: {:?} (srgb: {}), alpha mode: {:?}{}",
             surface_config.format,
             surface_config.format.is_srgb(),
             surface_config.alpha_mode,
+            if surface.is_some() { "" } else { " [headless]" },
         );
-        surface.configure(&device, &surface_config);
+        if let Some(surface) = &surface {
+            surface.configure(&device, &surface_config);
+        }
+        let offscreen = surface
+            .is_none()
+            .then(|| create_offscreen(&device, &surface_config));
 
         // Bind group layouts
         let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -425,6 +454,7 @@ impl Renderer {
             device,
             queue,
             surface,
+            offscreen,
             surface_config,
             mode: RenderMode::AlphaBlend,
             use_revealage: true,
@@ -540,6 +570,117 @@ impl Renderer {
             sh_degree: scene.sh_degree,
             splat_scale: 1.0,
         });
+    }
+
+    /// Read the offscreen target back and write it out as a PNG. Headless only -- a
+    /// swapchain image is not guaranteed to be copyable.
+    ///
+    /// Returns the un-premultiplied RGBA the file was written with. The target is an sRGB
+    /// format holding premultiplied alpha, so pixels are divided through by alpha to get
+    /// straight alpha, which is what PNG viewers expect.
+    pub fn capture_png(&self, path: &std::path::Path) -> Result<(), String> {
+        let texture = self
+            .offscreen
+            .as_ref()
+            .ok_or("capture_png requires a headless renderer")?;
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+
+        // Buffer rows must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT.
+        let unpadded = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = unpadded.div_ceil(align) * align;
+
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture readback"),
+            size: (padded as u64) * (height as u64),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("capture encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| format!("poll failed: {e:?}"))?;
+        rx.recv()
+            .map_err(|e| format!("map channel closed: {e}"))?
+            .map_err(|e| format!("buffer map failed: {e:?}"))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for row in 0..height {
+            let start = (row * padded) as usize;
+            let row_bytes = &mapped[start..start + unpadded as usize];
+            for px in row_bytes.chunks_exact(4) {
+                let a = px[3];
+                if a == 0 || a == 255 {
+                    pixels.extend_from_slice(px);
+                } else {
+                    // Un-premultiply into straight alpha for the file.
+                    let f = 255.0 / a as f32;
+                    pixels.push((px[0] as f32 * f).min(255.0) as u8);
+                    pixels.push((px[1] as f32 * f).min(255.0) as u8);
+                    pixels.push((px[2] as f32 * f).min(255.0) as u8);
+                    pixels.push(a);
+                }
+            }
+        }
+        drop(mapped);
+        buffer.unmap();
+
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        // The target is an sRGB format, so the bytes are already sRGB-encoded.
+        encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+        encoder
+            .write_header()
+            .and_then(|mut w| w.write_image_data(&pixels))
+            .map_err(|e| format!("png encode failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Block until the GPU has finished all submitted work.
+    ///
+    /// Headless has no present to synchronise on, so without this the timing loop would
+    /// measure command submission rather than execution.
+    pub fn wait_for_gpu(&self) {
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
 
     pub fn has_splats(&self) -> bool {
@@ -681,7 +822,11 @@ impl Renderer {
         let height = height.max(1);
         self.surface_config.width = width;
         self.surface_config.height = height;
-        self.surface.configure(&self.device, &self.surface_config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.surface_config);
+        } else {
+            self.offscreen = Some(create_offscreen(&self.device, &self.surface_config));
+        }
 
         self.depth_texture_view = create_depth_texture(&self.device, width, height);
 
@@ -814,12 +959,24 @@ impl Renderer {
     /// device's storage-binding limit are skipped rather than crashing the demo.
     /// Returns the new tile size and the total tiled-histogram footprint in MB.
     pub fn cycle_tile_size(&mut self) -> (u32, f64) {
-        let limit = self.device.limits().max_storage_buffer_binding_size as u64;
         let cur = TILE_SIZE_STEPS
             .iter()
             .position(|&t| t == self.tile_size)
             .unwrap_or(0);
-        for step in 1..=TILE_SIZE_STEPS.len() {
+        let next = TILE_SIZE_STEPS[(cur + 1) % TILE_SIZE_STEPS.len()];
+        self.set_tile_size(next)
+    }
+
+    /// Set the tile size directly, stepping past any value whose histogram would exceed
+    /// the device's storage-binding limit. Returns the size actually applied and the total
+    /// tiled-histogram footprint in MB.
+    pub fn set_tile_size(&mut self, tile_size: u32) -> (u32, f64) {
+        let limit = self.device.limits().max_storage_buffer_binding_size as u64;
+        let cur = TILE_SIZE_STEPS
+            .iter()
+            .position(|&t| t == tile_size)
+            .unwrap_or(0);
+        for step in 0..TILE_SIZE_STEPS.len() {
             let candidate = TILE_SIZE_STEPS[(cur + step) % TILE_SIZE_STEPS.len()];
             if self.tiled_bytes_with(candidate, self.num_bins).0 <= limit {
                 self.tile_size = candidate;
@@ -834,12 +991,23 @@ impl Renderer {
     /// Step to the next histogram bin count and rebuild, skipping any that would blow the
     /// storage-binding limit. Returns the new bin count and total footprint in MB.
     pub fn cycle_bin_count(&mut self) -> (u32, f64) {
-        let limit = self.device.limits().max_storage_buffer_binding_size as u64;
         let cur = BIN_COUNT_STEPS
             .iter()
             .position(|&b| b == self.num_bins)
             .unwrap_or(0);
-        for step in 1..=BIN_COUNT_STEPS.len() {
+        let next = BIN_COUNT_STEPS[(cur + 1) % BIN_COUNT_STEPS.len()];
+        self.set_bin_count(next)
+    }
+
+    /// Set the bin count directly, stepping past any value that would exceed the device's
+    /// storage-binding limit. Returns the count actually applied and the footprint in MB.
+    pub fn set_bin_count(&mut self, num_bins: u32) -> (u32, f64) {
+        let limit = self.device.limits().max_storage_buffer_binding_size as u64;
+        let cur = BIN_COUNT_STEPS
+            .iter()
+            .position(|&b| b == num_bins)
+            .unwrap_or(0);
+        for step in 0..BIN_COUNT_STEPS.len() {
             let candidate = BIN_COUNT_STEPS[(cur + step) % BIN_COUNT_STEPS.len()];
             if self.tiled_bytes_with(self.tile_size, candidate).0 <= limit {
                 self.num_bins = candidate;
@@ -927,21 +1095,32 @@ impl Renderer {
             );
         }
 
-        let output = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                return;
-            }
-            Err(e) => {
-                log::error!("Surface error: {:?}", e);
-                return;
-            }
+        // Headless has no swapchain to acquire; it draws straight into `offscreen`.
+        let output = match &self.surface {
+            Some(surface) => match surface.get_current_texture() {
+                Ok(t) => Some(t),
+                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    surface.configure(&self.device, &self.surface_config);
+                    return;
+                }
+                Err(e) => {
+                    log::error!("Surface error: {:?}", e);
+                    return;
+                }
+            },
+            None => None,
         };
 
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = match &output {
+            Some(frame) => frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+            None => self
+                .offscreen
+                .as_ref()
+                .expect("headless renderer without an offscreen target")
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+        };
 
         let mut encoder = self
             .device
@@ -962,7 +1141,9 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        if let Some(frame) = output {
+            frame.present();
+        }
 
         // Flip double buffer index
         self.frame_index = 1 - self.frame_index;
@@ -1155,6 +1336,24 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
     }
+}
+
+/// Offscreen colour target used in place of a swapchain image when headless.
+fn create_offscreen(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen target"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
 }
 
 fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

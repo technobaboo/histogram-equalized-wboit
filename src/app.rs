@@ -1,3 +1,4 @@
+use crate::bench::{Bench, BenchConfig};
 use crate::camera::Camera;
 use crate::renderer::{RenderMode, Renderer};
 use crate::scene::Scene;
@@ -14,6 +15,9 @@ pub struct App {
     camera: Camera,
     scene: Scene,
     last_frame: std::time::Instant,
+    /// Rolling frame-time accumulator, reported once a second.
+    frame_count: u32,
+    frame_accum: f32,
     scene_uploaded: bool,
 
     /// Loaded from the command line; `None` means the built-in quad scene.
@@ -22,13 +26,26 @@ pub struct App {
     splats_uploaded: bool,
     /// Index into `CAP_FRACTIONS`.
     cap: usize,
+
+    /// Present only with `--bench`: pins the camera, ignores input, and exits when done.
+    bench: Option<Bench>,
+    /// CLI overrides applied once the renderer exists.
+    distance_scale: Option<f32>,
+    tile_size: Option<u32>,
+    bins: Option<u32>,
 }
 
 /// Render-cap steps cycled with `C`, as a fraction of the loaded scene.
 const CAP_FRACTIONS: [f32; 4] = [1.0, 0.5, 0.25, 0.1];
 
 impl App {
-    pub fn new(splats: Option<SplatScene>) -> Self {
+    pub fn new(
+        splats: Option<SplatScene>,
+        bench: Option<BenchConfig>,
+        distance_scale: Option<f32>,
+        tile_size: Option<u32>,
+        bins: Option<u32>,
+    ) -> Self {
         let sorter = splats
             .as_ref()
             .map(|s| Sorter::new(std::sync::Arc::clone(&s.positions)));
@@ -38,12 +55,22 @@ impl App {
             camera: Camera::new(16.0 / 9.0),
             scene: Scene::new(),
             last_frame: std::time::Instant::now(),
+            frame_count: 0,
+            frame_accum: 0.0,
             scene_uploaded: false,
             splats,
             sorter,
             splats_uploaded: false,
             cap: 0,
+            bench: bench.map(Bench::new),
+            distance_scale,
+            tile_size,
+            bins,
         }
+    }
+
+    fn benching(&self) -> bool {
+        self.bench.is_some()
     }
 }
 
@@ -70,10 +97,49 @@ impl ApplicationHandler for App {
         if let Some(splats) = &self.splats {
             self.camera.fit_to(splats.center, splats.radius);
         }
+        // A fixed distance makes overdraw -- and therefore the whole measurement --
+        // reproducible across runs.
+        let distance_scale = self
+            .distance_scale
+            .or_else(|| self.bench.as_ref().map(|b| b.config.distance_scale));
+        if let Some(scale) = distance_scale {
+            let radius = self.splats.as_ref().map_or(6.0, |s| s.radius);
+            self.camera.distance = radius * scale;
+        }
 
-        let renderer = Renderer::new(window.clone());
+        let renderer = Renderer::new(
+            Some(window.clone()),
+            (size.width, size.height),
+            !self.benching(),
+        );
         self.renderer = Some(renderer);
         self.window = Some(window);
+
+        if let Some(renderer) = &mut self.renderer {
+            if let Some(t) = self
+                .tile_size
+                .or_else(|| self.bench.as_ref().and_then(|b| b.config.tile_size))
+            {
+                let (applied, _) = renderer.set_tile_size(t);
+                if applied != t {
+                    eprintln!("tile size {t} unavailable, using {applied}");
+                }
+            }
+            if let Some(b) = self
+                .bins
+                .or_else(|| self.bench.as_ref().and_then(|b| b.config.bins))
+            {
+                let (applied, _) = renderer.set_bin_count(b);
+                if applied != b {
+                    eprintln!("bin count {b} unavailable, using {applied}");
+                }
+            }
+            if let Some(bench) = &self.bench {
+                if let Some(mode) = bench.current_mode() {
+                    renderer.mode = mode;
+                }
+            }
+        }
 
         if let Some(renderer) = &self.renderer {
             println!("Mode: {}", renderer.mode.name());
@@ -81,6 +147,17 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // A benchmark that responds to a stray keypress or mouse drag is not a benchmark.
+        if self.benching()
+            && !matches!(
+                event,
+                WindowEvent::CloseRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::RedrawRequested
+            )
+        {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -221,6 +298,20 @@ premultiplied-sRGB mismatch with the compositor)"
                 let dt = (now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
 
+                self.frame_count += 1;
+                self.frame_accum += dt;
+                if self.frame_accum >= 1.0 && !self.benching() {
+                    let ms = self.frame_accum * 1000.0 / self.frame_count as f32;
+                    println!(
+                        "{:.2} ms/frame ({:.0} fps) [{}]",
+                        ms,
+                        1000.0 / ms,
+                        self.renderer.as_ref().map_or("", |r| r.mode.name()),
+                    );
+                    self.frame_count = 0;
+                    self.frame_accum = 0.0;
+                }
+
                 self.scene.update(dt);
 
                 if let Some(renderer) = &mut self.renderer {
@@ -247,6 +338,14 @@ premultiplied-sRGB mismatch with the compositor)"
                     }
 
                     renderer.render(&self.camera, &self.scene);
+
+                    if let Some(bench) = &mut self.bench {
+                        if bench.frame(dt) {
+                            event_loop.exit();
+                        } else if let Some(mode) = bench.current_mode() {
+                            renderer.mode = mode;
+                        }
+                    }
                 }
 
                 if let Some(window) = &self.window {
